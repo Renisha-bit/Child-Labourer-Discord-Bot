@@ -94,12 +94,12 @@ REACTION_ROLE_CATEGORIES = {
     "music": {
         "title": "🎵 MUSIC ROLES",
         "roles": {
-            "🎧": "Listener",
-            "🎸": "Musician",
-            "🎛️": "Producer",
-            "🎤": "Vocalist",
-            "✍️": "Songwriter",
-            "📀": "DJ"
+            "🎧": "♩ Listener",
+            "🎸": "♫ Musician",
+            "🎛️": "𝄞 Producer",
+            "🎤": "♬ Vocalist",
+            "✍️": "♯ Songwriter",
+            "📀": "♭ DJ"
         }
     },
 
