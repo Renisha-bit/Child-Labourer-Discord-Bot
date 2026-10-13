@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 load_dotenv()
 token = os.getenv("DISCORD_TOKEN")
 
-if not TOKEN:
+if not token:
     raise RuntimeError("DISCORD_TOKEN is missing. Check your .env file.")
 
 handler = logging.FileHandler(filename="discord.log", encoding="utf-8", mode="w")
