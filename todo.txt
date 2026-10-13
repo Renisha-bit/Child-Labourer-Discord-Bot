@@ -1,0 +1,11 @@
+high to low priority todo list
+
+Youtube push notification
+update the roles section and database 
+Add a remainder thing that child laborer send a message to restart the platform every 4 days amd tell 
+Some interactive commands
+how much time is left by checking the platform 
+see ig we can integrate ai with this bot and let bot it self interact with other in a seperate bot channel and bot have it own personality 
+Create a separate channel for child laboror after all new features are added 
+Send a message of all the interactive commands of child labror 
+
