@@ -1,9 +1,11 @@
 import asyncio
 import logging
 import os
+import traceback
 import xml.etree.ElementTree as ET
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Optional
 
 import aiohttp
 import discord
@@ -40,6 +42,9 @@ bot = commands.Bot(command_prefix=".", intents=intents)
 
 error_log = logging.getLogger("discord.bot")
 
+# Kept as a module variable (not an attribute on `bot`) so type checkers don't complain.
+youtube_task: Optional[asyncio.Task] = None
+
 # ========================= EVENTS =========================
 
 WELCOME_CHANNEL_ID = 1451964963085095044
@@ -48,19 +53,19 @@ WELCOME_CHANNEL_ID = 1451964963085095044
 
 @bot.event
 async def on_ready():
-    print(f"{bot.user.name} is working.")
+    print(f"{bot.user} is working.")
 
     # on_ready can fire again after a reconnect, so only (re)start the task if needed.
-    task = getattr(bot, "youtube_task", None)
-    if task is None or task.done():
-        bot.youtube_task = asyncio.create_task(check_youtube_upload())
+    global youtube_task
+    if youtube_task is None or youtube_task.done():
+        youtube_task = asyncio.create_task(check_youtube_upload())
 
 
 @bot.event
 async def on_member_join(member):
     channel = bot.get_channel(WELCOME_CHANNEL_ID)
 
-    if channel:
+    if isinstance(channel, discord.TextChannel):
         await channel.send(f"Welcome {member.mention} to the server!")
 
 
@@ -97,6 +102,8 @@ async def on_command_error(ctx, error):
         usage = f"{ctx.prefix}{ctx.command.qualified_name} {ctx.command.signature}".strip()
         await ctx.send(f"Usage: `{usage}`")
     else:
+        # Show it in the terminal too: log_handler sends discord's logging to discord.log only.
+        traceback.print_exception(type(error), error, error.__traceback__)
         error_log.error(
             "Unhandled error in command %s", ctx.command, exc_info=error
         )
@@ -283,7 +290,7 @@ async def check_youtube_upload():
                     UPLOAD_NOTIFICATION_CHANNEL_ID
                 )
 
-                if notification_channel is None:
+                if not isinstance(notification_channel, discord.TextChannel):
                     print(
                         "Upload notification channel not found. "
                         "Will retry later."

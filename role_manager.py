@@ -1,3 +1,17 @@
+"""Persistent, reaction-based role panels and an interactive Discord admin dashboard.
+
+Integrate into the existing bot with:
+    from role_manager import install_role_manager
+    install_role_manager(bot)
+
+This module is the ONLY place that handles reaction roles. main.py must not define
+its own on_raw_reaction_add / on_raw_reaction_remove handlers or panel commands,
+otherwise the two would fight each other (and ignore roles removed from the database).
+
+Keep the database file on persistent hosting storage and do not commit it if it
+contains server configuration you want to keep private.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -222,13 +236,13 @@ async def _find_panels(channel: discord.TextChannel):
 
     Returns (found, blocked, notes):
       found   -> {category_key: (message, webhook)} for panels we can edit
-      blocked -> category keys whose panel exists but whose webhook token is unavailable
+      blocked -> {category_key: message} for panels whose webhook is gone or has no token
       notes   -> human-readable remarks
     """
     hook_by_id = {hook.id: hook for hook in await channel.webhooks()}
     title_to_key = {row["title"]: row["key"] for row in _all_categories()}
     found: dict = {}
-    tokenless: set = set()
+    tokenless: dict = {}
     notes: list = []
     async for message in channel.history(limit=1000, oldest_first=False):
         if not message.webhook_id or not message.embeds:
@@ -241,17 +255,17 @@ async def _find_panels(channel: discord.TextChannel):
             continue
         hook = hook_by_id.get(message.webhook_id)
         if hook is None or not hook.token:
-            tokenless.add(key)
-            notes.append(f"{key}: found message `{message.id}`, but its webhook token isn't available")
+            tokenless.setdefault(key, message)
+            notes.append(f"{key}: found message `{message.id}`, but its webhook is gone or has no token")
             continue
         found[key] = (message, hook)
-    return found, tokenless - set(found), notes
+    return found, {k: m for k, m in tokenless.items() if k not in found}, notes
 
 
 async def _update_existing_panel(bot: commands.Bot, category_key: str) -> tuple[bool, str]:
     panel = _panel(category_key)
     if panel is None:
-        return False, "This category has not been linked to a panel yet. Run `.migrate_role_panels` (or `.setup_roles`) first."
+        return False, "This category has not been linked to a panel yet. Run `.migrate_role_panels` first."
     try:
         channel = await _get_channel(bot, int(panel["channel_id"]))
         if channel is None:
@@ -279,72 +293,109 @@ async def _update_existing_panel(bot: commands.Bot, category_key: str) -> tuple[
 
 # ========================= PANEL SETUP / MIGRATION =========================
 
-async def _migrate_panels(bot: commands.Bot) -> tuple[list[str], list[str]]:
-    """Link panels that already exist in the channel. Does not create, edit or delete messages."""
+async def _post_panel(channel: discord.TextChannel, key: str) -> discord.Message:
+    """Post a brand-new panel for a category and register it in the database."""
+    webhook = await _get_or_create_webhook(channel)
+    sent = await webhook.send(embed=_make_embed(key), wait=True)
+    # Save immediately so a failure while adding reactions can't cause duplicates on re-run.
+    _save_panel(key, channel.id, sent.id, webhook.id)
+    message = await channel.fetch_message(sent.id)
+    for row in _roles(key):
+        await message.add_reaction(row["emoji"])
+        await asyncio.sleep(0.3)  # stay under reaction rate limits
+    return message
+
+
+async def _ensure_panel(bot: commands.Bot, key: str, scan: Optional[dict] = None) -> tuple[str, str]:
+    """Make sure a category has a working, editable webhook panel.
+
+    Order: use the saved panel if it still works -> otherwise link a matching panel already
+    sitting in the channel -> otherwise post a new one.
+
+    Returns (status, detail). status is one of:
+      "ok"      already working, nothing was changed
+      "linked"  found an existing panel in the channel and linked it
+      "created" posted a new panel (already built from the database)
+      "error"   couldn't do it; detail says why
+    `scan` is an optional dict used to share one channel scan across several categories.
+    """
     channel = await _get_channel(bot)
     if channel is None:
-        return [], [_NO_CHANNEL]
-    found, blocked, notes = await _find_panels(channel)
-    linked = []
-    for category in _all_categories():
-        key = category["key"]
+        return "error", _NO_CHANNEL
+    try:
+        panel = _panel(key)
+        if panel is not None:
+            panel_channel = await _get_channel(bot, int(panel["channel_id"])) or channel
+            try:
+                await panel_channel.fetch_message(int(panel["message_id"]))
+                if await _get_webhook(panel_channel, int(panel["webhook_id"])) is not None:
+                    return "ok", ""
+            except discord.NotFound:
+                pass  # the panel message was deleted; recover below
+        if scan is None:
+            scan = {}
+        if "result" not in scan:
+            scan["result"] = await _find_panels(channel)
+        found, blocked, _notes = scan["result"]
         if key in found:
             message, hook = found[key]
             _save_panel(key, channel.id, message.id, hook.id)
-            linked.append(f"{key} → message `{message.id}`")
-        elif key not in blocked:
-            notes.append(f"{key}: no panel found for title `{category['title']}` (run `.setup_roles` to create it)")
-    return linked, notes
+            return "linked", f"linked the existing panel (message `{message.id}`)"
+        message = await _post_panel(channel, key)
+        if key in blocked:
+            return "created", (
+                f"posted a new panel (message `{message.id}`). The old panel {blocked[key].jump_url} "
+                "was made by a webhook that no longer exists, so it can't be edited - "
+                "delete it when you're ready"
+            )
+        return "created", f"posted a new panel (message `{message.id}`)"
+    except discord.Forbidden:
+        return "error", "Missing permission. I need Manage Webhooks, Add Reactions and Read Message History in the role channel."
+    except discord.HTTPException as exc:
+        return "error", f"Discord error: {exc}"
+
+
+async def _sync_panel(bot: commands.Bot, key: str) -> tuple[bool, str, bool]:
+    """Ensure the panel exists, then bring its embed up to date with the database.
+
+    Returns (ok, message, rebuilt). rebuilt=True means a fresh panel was posted, which
+    already includes everything (roles and reactions), so there is nothing left to edit.
+    """
+    status, detail = await _ensure_panel(bot, key)
+    if status == "error":
+        return False, detail, False
+    if status == "created":
+        return True, f"The panel was missing, so I {detail}.", True
+    ok, message = await _update_existing_panel(bot, key)
+    if ok and status == "linked":
+        message = f"I {detail} first. {message}"
+    return ok, message, False
 
 
 async def _setup_panels(bot: commands.Bot) -> str:
-    """Safe, repeatable setup: link existing panels and create only the ones that are missing."""
-    channel = await _get_channel(bot)
-    if channel is None:
-        return _NO_CHANNEL
-    try:
-        found, blocked, notes = await _find_panels(channel)
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        return f"I couldn't inspect the role channel: {exc}. I need Manage Webhooks and Read Message History."
-
-    created, linked, skipped = [], [], []
-    webhook: Optional[discord.Webhook] = None
+    """Safe, repeatable: keep working panels, link ones that exist, create any that are missing."""
+    scan: dict = {}
+    working, linked, created, problems = [], [], [], []
     for category in _all_categories():
         key = category["key"]
-        if _panel(key) is not None:
-            continue  # already linked
-        if key in found:
-            message, hook = found[key]
-            _save_panel(key, channel.id, message.id, hook.id)
+        status, detail = await _ensure_panel(bot, key, scan)
+        if status == "error" and detail == _NO_CHANNEL:
+            return detail
+        if status == "ok":
+            working.append(key)
+        elif status == "linked":
             linked.append(key)
-            continue
-        if key in blocked:
-            skipped.append(f"{key}: a panel exists but I can't edit it, so I didn't create a duplicate")
-            continue
-        try:
-            if webhook is None:
-                webhook = await _get_or_create_webhook(channel)
-            sent = await webhook.send(embed=_make_embed(key), wait=True)
-            # Save immediately so a failure while adding reactions can't cause duplicates on re-run.
-            _save_panel(key, channel.id, sent.id, webhook.id)
-            message = await channel.fetch_message(sent.id)
-            for row in _roles(key):
-                await message.add_reaction(row["emoji"])
-                await asyncio.sleep(0.3)  # stay under reaction rate limits
-            created.append(key)
-        except discord.Forbidden:
-            skipped.append(f"{key}: missing permission (Manage Webhooks / Add Reactions)")
-        except discord.HTTPException as exc:
-            skipped.append(f"{key}: Discord error: {exc}")
-
+        elif status == "created":
+            created.append(f"{key}: {detail}")
+        else:
+            problems.append(f"{key}: {detail}")
     lines = [
-        f"**Created:** {', '.join(created) or 'nothing'}",
-        f"**Linked existing:** {', '.join(linked) or 'nothing'}",
+        f"**Already working:** {', '.join(working) or 'none'}",
+        f"**Linked existing panels:** {', '.join(linked) or 'none'}",
+        f"**Created new panels:** {'; '.join(created) or 'none'}",
     ]
-    if skipped:
-        lines += ["**Problems:**", *skipped]
-    if notes:
-        lines += ["**Notes:**", *notes]
+    if problems:
+        lines += ["**Problems:**", *problems]
     return "\n".join(lines)
 
 
@@ -367,16 +418,20 @@ async def _add_role(bot: commands.Bot, guild: discord.Guild, category_key: str, 
         return f"`{role.name}` is above my highest role, so I couldn't assign it. Move my role higher first."
     if _find_mapping(category_key, emoji) is not None:
         return f"Emoji {emoji} is already used in `{category_key}`. Remove or change that mapping first."
+    if len(_roles(category_key)) >= 20:
+        return "Discord allows at most 20 different reactions on one message. Create another category instead."
     with _db() as db:
         db.execute(
             "INSERT INTO role_mappings(category_key, emoji, role_name, role_id) VALUES (?, ?, ?, ?)",
             (category_key, emoji, role.name, role.id),
         )
-    ok, message = await _update_existing_panel(bot, category_key)
+    ok, message, rebuilt = await _sync_panel(bot, category_key)
     if not ok:
         with _db() as db:
             db.execute("DELETE FROM role_mappings WHERE category_key = ? AND emoji = ?", (category_key, emoji))
         return message
+    if rebuilt:
+        return f"Added {emoji} → **{role.name}** to `{category_key}`. {message}"
     try:
         panel = _panel(category_key)
         channel = await _get_channel(bot, int(panel["channel_id"]))
@@ -399,7 +454,7 @@ async def _remove_role(bot: commands.Bot, category_key: str, emoji: str) -> str:
         return f"No mapping for {emoji} exists in `{category_key}`."
     with _db() as db:
         db.execute("DELETE FROM role_mappings WHERE category_key = ? AND emoji = ?", (category_key, old["emoji"]))
-    ok, message = await _update_existing_panel(bot, category_key)
+    ok, message, rebuilt = await _sync_panel(bot, category_key)
     if not ok:
         with _db() as db:
             db.execute(
@@ -407,6 +462,8 @@ async def _remove_role(bot: commands.Bot, category_key: str, emoji: str) -> str:
                 (category_key, old["emoji"], old["role_name"], old["role_id"]),
             )
         return message
+    if rebuilt:
+        return f"Removed {old['emoji']} from `{category_key}`. {message}"
     # Remove only the bot's own seed reaction. Never clear members' reactions.
     panel = _panel(category_key)
     try:
@@ -424,9 +481,6 @@ async def _edit_panel_appearance(bot: commands.Bot, category_key: str, title: st
     category = _category(category_key)
     if category is None:
         return f"Unknown category `{category_key}`. Use `.rolecategories` to see categories."
-    panel = _panel(category_key)
-    if panel is None:
-        return "This category isn't linked to a panel yet. Run `.migrate_role_panels` (or `.setup_roles`) first."
     color = _parse_color(color_hex)
     if color is None:
         return "Enter a valid hex color, for example `#C5B3D3`."
@@ -434,6 +488,12 @@ async def _edit_panel_appearance(bot: commands.Bot, category_key: str, title: st
     for label, url in (("image", image_url), ("thumbnail", thumbnail_url)):
         if url and not url.lower().startswith(("https://", "http://")):
             return f"The {label} must be an `https://` or `http://` URL, or left blank."
+    # Make sure a panel exists (link or create it) before editing it.
+    status, detail = await _ensure_panel(bot, category_key)
+    if status == "error":
+        return detail
+    note = f"(The panel was missing, so I {detail}.) " if status in ("linked", "created") else ""
+    panel = _panel(category_key)
     try:
         channel = await _get_channel(bot, int(panel["channel_id"]))
         if channel is None:
@@ -461,7 +521,7 @@ async def _edit_panel_appearance(bot: commands.Bot, category_key: str, title: st
                 "UPDATE categories SET title = ?, color = ?, footer = ?, image_url = ?, thumbnail_url = ? WHERE key = ?",
                 (embed.title, color, footer[:2048], image_url, thumbnail_url, category_key),
             )
-        return f"Updated the existing `{category_key}` webhook panel's appearance."
+        return f"{note}Updated the existing `{category_key}` webhook panel's appearance."
     except discord.NotFound:
         return "The saved panel message no longer exists. No replacement was created."
     except discord.Forbidden:
@@ -529,7 +589,8 @@ class AddRoleModal(_SafeModal, title="Add a role"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.guild:
-            return await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+            await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+            return
         # Editing panels takes several API calls; defer so Discord's 3-second limit isn't hit.
         await interaction.response.defer(ephemeral=True, thinking=True)
         result = await _add_role(self.bot, interaction.guild, str(self.category_key), str(self.emoji), str(self.role_name))
@@ -561,7 +622,8 @@ class AddCategoryModal(_SafeModal, title="Create a role category"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.guild:
-            return await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+            await interaction.response.send_message("Use this inside your server.", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True, thinking=True)
         result = await _add_category(self.bot, str(self.key), str(self.title_text), str(self.color))
         await interaction.followup.send(result, ephemeral=True)
@@ -615,15 +677,11 @@ class RoleDashboardView(discord.ui.View):
     async def add_category(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AddCategoryModal(self.bot))
 
-    @discord.ui.button(label="Migrate existing panels", style=discord.ButtonStyle.secondary, emoji="🔎")
-    async def migrate(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Sync panels", style=discord.ButtonStyle.secondary, emoji="🔎")
+    async def sync_panels(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            linked, issues = await _migrate_panels(self.bot)
-            lines = ["**Linked panels:**", *(linked or ["None linked."]), "", "**Notes:**", *(issues or ["No issues found."])]
-            await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            await interaction.followup.send(f"Migration couldn't inspect the channel: {exc}", ephemeral=True)
+        result = await _setup_panels(self.bot)
+        await interaction.followup.send(f"{result}\n\nCommand: `.migrate_role_panels`"[:1900], ephemeral=True)
 
     @discord.ui.button(label="Customize panel", style=discord.ButtonStyle.primary, emoji="🎨")
     async def customize_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -633,7 +691,7 @@ class RoleDashboardView(discord.ui.View):
     async def show_categories(self, interaction: discord.Interaction, button: discord.ui.Button):
         lines = []
         for row in _all_categories():
-            status = "linked" if _panel(row["key"]) else "not linked — migrate first"
+            status = "linked" if _panel(row["key"]) else "no panel yet — press Sync panels"
             lines.append(f"**{row['title']}** · ID: `{row['key']}` · {len(_roles(row['key']))} roles · {status}")
         embed = discord.Embed(title="Role categories", description="\n".join(lines) or "No categories yet.", color=DEFAULT_COLOR)
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -689,10 +747,9 @@ def install_role_manager(bot: commands.Bot) -> None:
                 "Manage reaction-role panels without editing Python.\n\n"
                 "**Dashboard actions**\n"
                 "➕ Add role · ➖ Remove role · 🗂️ Add category\n"
-                "🎨 Customize panel · 🔎 Migrate panels · 📋 Show categories\n\n"
+                "🎨 Customize panel · 🔎 Sync panels · 📋 Show categories\n\n"
                 "**Copyable commands**\n"
-                "`.setup_roles` — create any missing panels (safe to re-run)\n"
-                "`.migrate_role_panels` — link the current panels\n"
+                "`.migrate_role_panels` — keep, link or create panels as needed (safe to re-run)\n"
                 "`.rolecategories` — list categories\n"
                 "`.roleadd games 🎮 Terraria` — add a role\n"
                 "`.roleremove games 🎮` — remove a mapping\n"
@@ -710,17 +767,12 @@ def install_role_manager(bot: commands.Bot) -> None:
         await ctx.send("Checking the role channel. I'll only create panels that are missing…")
         await ctx.send((await _setup_panels(bot))[:1900])
 
-    @bot.command(name="migrate_role_panels", help="Register current webhook panels without recreating them.")
+    @bot.command(name="migrate_role_panels", help="Check every panel: keep, link or create as needed (same as .setup_roles).")
     @commands.guild_only()
     @commands.has_guild_permissions(manage_guild=True)
     async def migrate_role_panels(ctx: commands.Context):
-        await ctx.send("Checking the existing role panels. I won't create, edit, or delete messages during migration…")
-        try:
-            linked, issues = await _migrate_panels(bot)
-            result = ["**Linked panels:**", *(linked or ["None linked."]), "", "**Notes:**", *(issues or ["No issues found."])]
-            await ctx.send("\n".join(result)[:1900])
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            await ctx.send(f"Migration couldn't inspect the role channel: {exc}")
+        await ctx.send("Checking the role panels. I'll keep working ones, link existing ones, and create any that are missing…")
+        await ctx.send((await _setup_panels(bot))[:1900])
 
     @bot.command(name="rolecategories", help="List configured role categories and their panel status.")
     @commands.guild_only()
@@ -735,6 +787,8 @@ def install_role_manager(bot: commands.Bot) -> None:
     @commands.guild_only()
     @commands.has_guild_permissions(manage_guild=True)
     async def roleadd(ctx: commands.Context, category_key: str, emoji: str, *, role_name: str):
+        if ctx.guild is None:
+            return
         async with ctx.typing():
             result = await _add_role(bot, ctx.guild, category_key, emoji, role_name)
         await ctx.send(result)
@@ -784,4 +838,5 @@ def install_role_manager(bot: commands.Bot) -> None:
     # add_listener (not @bot.event) so these never replace any handler defined elsewhere.
     bot.add_listener(on_raw_reaction_add, "on_raw_reaction_add")
     bot.add_listener(on_raw_reaction_remove, "on_raw_reaction_remove")
+    print("Role manager loaded: .roles, .migrate_role_panels, .setup_roles, .rolecategories, .roleadd, .roleremove, .panelcolor")
  
