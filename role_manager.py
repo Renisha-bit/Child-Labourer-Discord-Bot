@@ -750,6 +750,7 @@ def install_role_manager(bot: commands.Bot) -> None:
                 "🎨 Customize panel · 🔎 Sync panels · 📋 Show categories\n\n"
                 "**Copyable commands**\n"
                 "`.migrate_role_panels` — keep, link or create panels as needed (safe to re-run)\n"
+                "`.rolecheck` — diagnose permissions, webhooks and saved panels\n"
                 "`.rolecategories` — list categories\n"
                 "`.roleadd games 🎮 Terraria` — add a role\n"
                 "`.roleremove games 🎮` — remove a mapping\n"
@@ -766,6 +767,32 @@ def install_role_manager(bot: commands.Bot) -> None:
     async def setup_roles(ctx: commands.Context):
         await ctx.send("Checking the role channel. I'll only create panels that are missing…")
         await ctx.send((await _setup_panels(bot))[:1900])
+
+    @bot.command(name="rolecheck", help="Diagnose the role panel setup: channel, permissions, webhooks, saved panels.")
+    @commands.guild_only()
+    @commands.has_guild_permissions(manage_guild=True)
+    async def rolecheck(ctx: commands.Context):
+        channel = await _get_channel(bot)
+        if channel is None:
+            await ctx.send(f"{_NO_CHANNEL} (ROLE_CHANNEL_ID is `{ROLE_CHANNEL_ID}`)")
+            return
+        lines = [f"**Role channel:** {channel.mention} (`{channel.id}`)"]
+        perms = channel.permissions_for(channel.guild.me)
+        needed = ("view_channel", "send_messages", "embed_links", "add_reactions", "read_message_history", "manage_webhooks")
+        missing = [name for name in needed if not getattr(perms, name)]
+        lines.append("**Bot permissions in that channel:** " + ("all OK" if not missing else "MISSING " + ", ".join(missing)))
+        try:
+            hooks = await channel.webhooks()
+            lines.append(f"**Webhooks in that channel:** {len(hooks)}")
+            for hook in hooks:
+                lines.append(f"• {hook.name} (`{hook.id}`): " + ("bot can edit it" if hook.token else "no token, bot can't edit it"))
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            lines.append(f"**Webhooks in that channel:** couldn't list them ({exc})")
+        lines.append("**Saved panels:**")
+        for row in _all_categories():
+            panel = _panel(row["key"])
+            lines.append(f"• `{row['key']}`: " + (f"message `{panel['message_id']}`, webhook `{panel['webhook_id']}`" if panel else "none yet"))
+        await ctx.send("\n".join(lines)[:1900])
 
     @bot.command(name="migrate_role_panels", help="Check every panel: keep, link or create as needed (same as .setup_roles).")
     @commands.guild_only()
@@ -838,5 +865,5 @@ def install_role_manager(bot: commands.Bot) -> None:
     # add_listener (not @bot.event) so these never replace any handler defined elsewhere.
     bot.add_listener(on_raw_reaction_add, "on_raw_reaction_add")
     bot.add_listener(on_raw_reaction_remove, "on_raw_reaction_remove")
-    print("Role manager loaded: .roles, .migrate_role_panels, .setup_roles, .rolecategories, .roleadd, .roleremove, .panelcolor")
+    print("Role manager loaded: .roles, .rolecheck, .migrate_role_panels, .setup_roles, .rolecategories, .roleadd, .roleremove, .panelcolor")
  
