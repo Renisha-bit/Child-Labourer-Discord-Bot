@@ -1,11 +1,18 @@
+import asyncio
+import logging
+import os
+import xml.etree.ElementTree as ET
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+import aiohttp
 import discord
 from discord.ext import commands
-import logging
 from dotenv import load_dotenv
-import os
-import aiohttp
-import asyncio
-import xml.etree.ElementTree as ET
+
+# Reaction roles live entirely in role_manager.py (database-driven). main.py must not
+# define its own reaction handlers or panel commands, or the two would clash.
+from role_manager import ROLE_CHANNEL_ID, install_role_manager
 
 load_dotenv()
 token = os.getenv("DISCORD_TOKEN")
@@ -13,34 +20,49 @@ token = os.getenv("DISCORD_TOKEN")
 if not token:
     raise RuntimeError("DISCORD_TOKEN is missing. Check your .env file.")
 
-handler = logging.FileHandler(filename="discord.log", encoding="utf-8", mode="w")
+BASE_DIR = Path(__file__).resolve().parent
+
+# Rotating so the log neither grows forever nor gets wiped on every restart.
+handler = RotatingFileHandler(
+    BASE_DIR / "discord.log",
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
+    encoding="utf-8",
+)
 
 # ========================= BOT SETUP =========================
 
-intents = discord.Intents.all()
+intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.reactions = True
 
 bot = commands.Bot(command_prefix=".", intents=intents)
 
+error_log = logging.getLogger("discord.bot")
+
 # ========================= EVENTS =========================
+
+WELCOME_CHANNEL_ID = 1451964963085095044
+# ↑ #welcome channel ID here
+
 
 @bot.event
 async def on_ready():
     print(f"{bot.user.name} is working.")
 
-    if not hasattr(bot, "youtube_task"):
+    # on_ready can fire again after a reconnect, so only (re)start the task if needed.
+    task = getattr(bot, "youtube_task", None)
+    if task is None or task.done():
         bot.youtube_task = asyncio.create_task(check_youtube_upload())
 
 
 @bot.event
 async def on_member_join(member):
-    channel = bot.get_channel(1451964963085095044)
-    # # ↑ #welcome channel ID here
+    channel = bot.get_channel(WELCOME_CHANNEL_ID)
 
     if channel:
         await channel.send(f"Welcome {member.mention} to the server!")
+
 
 # @bot.event
 # async def on_message(message):
@@ -60,15 +82,36 @@ async def on_member_join(member):
 
 #     await bot.process_commands(message)
 
+
+@bot.event
+async def on_command_error(ctx, error):
+    # Without this, every failed permission check dumps a traceback and the user gets no reply.
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+    if isinstance(error, commands.NoPrivateMessage):
+        await ctx.send("That command only works inside a server.")
+    elif isinstance(error, (commands.MissingPermissions, commands.CheckFailure)):
+        await ctx.send("You don't have permission to use that command.")
+    elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+        usage = f"{ctx.prefix}{ctx.command.qualified_name} {ctx.command.signature}".strip()
+        await ctx.send(f"Usage: `{usage}`")
+    else:
+        error_log.error(
+            "Unhandled error in command %s", ctx.command, exc_info=error
+        )
+        await ctx.send("Something went wrong running that command.")
+
 # ========================= COMMANDS =========================
-# NORNAML INTERACTIVE COMMANDS
+# NORMAL INTERACTIVE COMMANDS
 @bot.command()
 async def ping(ctx):
     await ctx.send("Pong!")
 
-#ANNOUNCE COMMAND
+# ANNOUNCE COMMAND
 
 @bot.command()
+@commands.guild_only()
 @commands.has_permissions(administrator=True)
 async def announce(ctx):
     await ctx.send("Which channel should I send the message to?\nPlease enter the channel ID:")
@@ -82,7 +125,11 @@ async def announce(ctx):
         channel_id = int(channel_message.content.strip())
         channel = bot.get_channel(channel_id)
 
-        if channel is None:
+        # Only allow channels in this server, so an admin here can't post in another server.
+        if (
+            not isinstance(channel, discord.abc.Messageable)
+            or getattr(channel, "guild", None) != ctx.guild
+        ):
             await ctx.send("I couldn't find that channel.")
             return
 
@@ -98,259 +145,23 @@ async def announce(ctx):
     except ValueError:
         await ctx.send("That isn't a valid channel ID.")
 
-    except TimeoutError:
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to send messages in that channel.")
+
+    except discord.HTTPException as error:
+        await ctx.send(f"Couldn't send the message: {error}")
+
+    except asyncio.TimeoutError:
         await ctx.send("Timed out. Please run `.announce` again.")
-
-# ========================= REACTION ROLES =========================
-
-REACTION_ROLE_CHANNEL_ID = 1550216770156232834
-# ↑ #roles channel ID here
-
-
-REACTION_ROLE_CATEGORIES = {
-
-    "music": {
-        "title": "🎵 MUSIC ROLES",
-        "roles": {
-            "🎧": "♩ Listener",
-            "🎸": "♫ Musician",
-            "🎛️": "𝄞 Producer",
-            "🎤": "♬ Vocalist",
-            "✍️": "♯ Songwriter",
-            "📀": "♭ DJ"
-        }
-    },
-
-    "notifications": {
-        "title": "🔔 NOTIFICATION ROLES",
-        "roles": {
-            "🔔": "Upload Ping",
-            "📢": "VC Ping"
-        }
-    },
-
-    "games": {
-        "title": "🎮 GAME ROLES",
-        "roles": {
-            "⚔️": "Valorant",
-            "⛏️": "Minecraft"
-        }
-    },
-
-    "colors": {
-        "title": "🎨 COLORS",
-        "roles": {
-            "🔴": "Red",
-            "🟠": "Orange",
-            "🟡": "Yellow",
-            "🟢": "Green",
-            "🔵": "Blue",
-            "🟣": "Purple",
-            "🩷": "Pink",
-            "⚪": "White",
-            "⚫": "Black"
-        }
-    }
-}
-# ========================= SETUP REACTION ROLE PANELS =========================
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setup_roles(ctx):
-    channel = bot.get_channel(REACTION_ROLE_CHANNEL_ID)
-
-    if not isinstance(channel, discord.TextChannel):
-        await ctx.send(
-            "I couldn't find the reaction-role text channel. "
-            "Check REACTION_ROLE_CHANNEL_ID."
-        )
-        return
-
-    try:
-        webhook = await channel.create_webhook(
-            name="ChildLaborer Role Panels",
-            reason="Creating reaction-role panels"
-        )
-    except discord.Forbidden:
-        await ctx.send(
-            "I need the Manage Webhooks permission!"
-        )
-        return
-    except discord.HTTPException as error:
-        await ctx.send(f"Couldn't create webhook: {error}")
-        return
-
-    panel_color = discord.Color.from_str("#C5B3D3")
-
-    for category in REACTION_ROLE_CATEGORIES.values():
-        embed = discord.Embed(
-            title=category["title"],
-            description=(
-                "Choose your roles below!\n"
-                "React with an emoji to get a role, "
-                "or remove your reaction to remove it."
-            ),
-            color=panel_color
-        )
-
-        role_lines = [
-            f"{emoji}  →  **{role_name}**"
-            for emoji, role_name in category["roles"].items()
-        ]
-
-        embed.add_field(
-            name="Available Roles",
-            value="\n".join(role_lines),
-            inline=False
-        )
-
-        embed.set_footer(
-            text="ChildLaborer • Reaction Roles"
-        )
-
-        try:
-            message = await webhook.send(
-                embed=embed,
-                username="ChildLaborer",
-                wait=True
-            )
-
-            for emoji in category["roles"]:
-                await message.add_reaction(emoji)
-                await asyncio.sleep(0.3)
-
-        except discord.HTTPException as error:
-            print(
-                f"Failed to create {category['title']} panel: {error}"
-            )
-            await ctx.send(
-                f"Failed to create {category['title']} panel."
-            )
-            return
-
-    await ctx.send(
-        "All four webhook reaction-role panels have been created!"
-    )
-
-# ========================= REACTION ROLE HELPERS =========================
-async def get_role_panel_and_role(payload):
-    if payload.guild_id is None:
-        return None
-
-    guild = bot.get_guild(payload.guild_id)
-    if guild is None:
-        return None
-
-    emoji = str(payload.emoji)
-    role_name = None
-    expected_title = None
-
-    for category in REACTION_ROLE_CATEGORIES.values():
-        if emoji in category["roles"]:
-            role_name = category["roles"][emoji]
-            expected_title = category["title"]
-            break
-
-    if role_name is None:
-        return None
-
-    channel = bot.get_channel(payload.channel_id)
-    if channel is None:
-        return None
-
-    try:
-        message = await channel.fetch_message(payload.message_id)
-    except (
-        discord.NotFound,
-        discord.Forbidden,
-        discord.HTTPException
-    ):
-        return None
-
-    is_role_panel = any(
-        embed.title == expected_title
-        for embed in message.embeds
-    )
-
-    if message.webhook_id is None or not is_role_panel:
-        return None
-
-    role = discord.utils.get(guild.roles, name=role_name)
-
-    if role is None:
-        print(f"Role not found: {role_name}")
-        return None
-
-    try:
-        member = guild.get_member(payload.user_id)
-
-        if member is None:
-            member = await guild.fetch_member(payload.user_id)
-
-    except (
-        discord.NotFound,
-        discord.Forbidden,
-        discord.HTTPException
-    ):
-        return None
-
-    if member.bot:
-        return None
-
-    return member, role
-
-
-@bot.event
-async def on_raw_reaction_add(payload):
-    result = await get_role_panel_and_role(payload)
-
-    if result is None:
-        return
-
-    member, role = result
-
-    try:
-        await member.add_roles(
-            role,
-            reason="Reaction role selected"
-        )
-    except discord.Forbidden:
-        print(
-            f"Cannot give {role.name} to {member.name}. "
-            "Check Manage Roles and role hierarchy."
-        )
-    except discord.HTTPException as error:
-        print(f"Failed to add {role.name}: {error}")
-
-
-@bot.event
-async def on_raw_reaction_remove(payload):
-    result = await get_role_panel_and_role(payload)
-
-    if result is None:
-        return
-
-    member, role = result
-
-    try:
-        await member.remove_roles(
-            role,
-            reason="Reaction role deselected"
-        )
-    except discord.Forbidden:
-        print(
-            f"Cannot remove {role.name} from {member.name}. "
-            "Check Manage Roles and role hierarchy."
-        )
-    except discord.HTTPException as error:
-        print(f"Failed to remove {role.name}: {error}")
-
 
 # ========================= YOUTUBE UPLOAD NOTIFICATIONS =========================
 
 UPLOAD_NOTIFICATION_CHANNEL_ID = 1444934366043177033
 YOUTUBE_CHANNEL_ID = "UCOovil69O5hsE2pQz9XdtPQ"
 UPLOAD_ROLE_NAME = "Upload Ping"
-# ========================= YOUTUBE UPLOAD CHECK =========================
+# Absolute path so the saved state doesn't depend on where the bot is launched from.
+YOUTUBE_STATE_FILE = BASE_DIR / "last_video_id.txt"
+
 # ========================= YOUTUBE STATE HELPERS =========================
 
 def read_last_video_id():
@@ -483,37 +294,39 @@ async def check_youtube_upload():
                 # RSS entries are newest-first. Stop at the saved ID,
                 # then reverse the new entries to announce oldest-first.
                 new_videos = []
+                found = False
 
                 for video in videos:
                     if video["id"] == last_video_id:
+                        found = True
                         break
                     new_videos.append(video)
 
-                if not new_videos:
+                if not found:
                     print(
                         "Saved video wasn't found in the current RSS "
                         "feed. The feed may have rolled over."
                     )
-                    # Avoid repeatedly announcing the same feed.
-                    # Save the newest entry as the new baseline.
+                    # Don't announce the whole feed. Save the newest
+                    # entry as the new baseline instead.
                     last_video_id = newest_video_id
                     save_last_video_id(last_video_id)
 
                 else:
+                    role = discord.utils.get(
+                        notification_channel.guild.roles,
+                        name=UPLOAD_ROLE_NAME
+                    )
+
+                    role_mention = (
+                        role.mention if role is not None else ""
+                    )
+
                     for video in reversed(new_videos):
                         video_id = video["id"]
                         title = video["title"]
                         channel_name = video["channel_name"]
                         channel_url = video["channel_url"]
-
-                        role = discord.utils.get(
-                            notification_channel.guild.roles,
-                            name=UPLOAD_ROLE_NAME
-                        )
-
-                        role_mention = (
-                            role.mention if role is not None else ""
-                        )
 
                         video_url = (
                             "https://www.youtube.com/watch?v="
@@ -553,7 +366,7 @@ async def check_youtube_upload():
                             f"[{channel_name}]({channel_url})\n\n"
                             f"> If you'd like to stop getting notified, "
                             f"adjust your roles in "
-                            f"<#{REACTION_ROLE_CHANNEL_ID}>."
+                            f"<#{ROLE_CHANNEL_ID}>."
                         )
 
                         try:
@@ -584,238 +397,11 @@ async def check_youtube_upload():
 
         await asyncio.sleep(300)
 
-# ========================= SETUP REACTION ROLES =========================
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setup_roles(ctx):
-
-    channel = bot.get_channel(REACTION_ROLE_CHANNEL_ID)
-
-    if channel is None:
-        await ctx.send("I couldn't find the reaction role channel.")
-        return
-
-    # Create a webhook for the role panels
-    try:
-        webhook = await channel.create_webhook(
-            name="ChildLaborer Role Panels",
-            reason="Creating reaction role panels"
-        )
-
-    except discord.Forbidden:
-        await ctx.send(
-            "I need the Manage Webhooks permission "
-            "to create the role panels!"
-        )
-        return
-
-    except discord.HTTPException as error:
-        await ctx.send(f"Couldn't create webhook: {error}")
-        return
-
-    # Embed colour for all role panels
-    panel_color = discord.Color.from_str("#C5B3D3")
-
-    # Create one embed per category
-    for category in REACTION_ROLE_CATEGORIES.values():
-
-        embed = discord.Embed(
-            title=category["title"],
-            description=(
-                "Choose your roles below!\n"
-                "React with an emoji to get a role, "
-                "or remove your reaction to remove it."
-            ),
-            color=panel_color
-        )
-
-        role_lines = []
-
-        for emoji, role_name in category["roles"].items():
-            role_lines.append(f"{emoji}  →  **{role_name}**")
-
-        embed.add_field(
-            name="Available Roles",
-            value="\n".join(role_lines),
-            inline=False
-        )
-
-        embed.set_footer(
-            text="ChildLaborer • Reaction Roles"
-        )
-
-        try:
-            # Send the embed through the webhook
-            message = await webhook.send(
-                embed=embed,
-                username="ChildLaborer",
-                wait=True
-            )
-
-            # Add the corresponding reactions
-            for emoji in category["roles"]:
-                await message.add_reaction(emoji)
-
-                # Avoid hitting Discord rate limits
-                await asyncio.sleep(0.3)
-
-        except discord.HTTPException as error:
-            print(
-                f"Failed to create {category['title']} panel: {error}"
-            )
-            await ctx.send(
-                f"Failed to create {category['title']} panel."
-            )
-            return
-
-    await ctx.send(
-        "All four webhook reaction-role panels have been created!"
-    )
-
-# ========================= ROLES =========================
-
-
-# ========================= REACTION ROLE ADD =========================
-
-@bot.event
-async def on_raw_reaction_add(payload):
-
-    if payload.guild_id is None:
-        return
-
-    guild = bot.get_guild(payload.guild_id)
-    if guild is None:
-        return
-
-    # Ignore bot reactions
-    if payload.user_id == bot.user.id:
-        return
-
-    try:
-        member = guild.get_member(payload.user_id)
-        if member is None:
-            member = await guild.fetch_member(payload.user_id)
-    except discord.NotFound:
-        return
-
-    if member.bot:
-        return
-
-    emoji = str(payload.emoji)
-    role_name = None
-    expected_title = None
-
-    # Find the matching role
-    for category in REACTION_ROLE_CATEGORIES.values():
-        if emoji in category["roles"]:
-            role_name = category["roles"][emoji]
-            expected_title = category["title"]
-            break
-
-    if role_name is None:
-        return
-
-    channel = bot.get_channel(payload.channel_id)
-    if channel is None:
-        return
-
-    try:
-        message = await channel.fetch_message(payload.message_id)
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        return
-
-    # Accept webhook messages with matching embed titles
-    is_role_panel = any(
-        embed.title == expected_title
-        for embed in message.embeds
-    )
-
-    if message.webhook_id is None or not is_role_panel:
-        return
-
-    role = discord.utils.get(guild.roles, name=role_name)
-
-    if role is None:
-        print(f"Role not found: {role_name}")
-        return
-
-    try:
-        await member.add_roles(role, reason="Reaction role")
-    except discord.Forbidden:
-        print(f"Cannot give {role_name} to {member.name}")
-    except discord.HTTPException as error:
-        print(f"Failed to add {role_name}: {error}")
-
-
-# ========================= REACTION ROLE REMOVE =========================
-
-@bot.event
-async def on_raw_reaction_remove(payload):
-
-    if payload.guild_id is None:
-        return
-
-    guild = bot.get_guild(payload.guild_id)
-    if guild is None:
-        return
-
-    try:
-        member = guild.get_member(payload.user_id)
-        if member is None:
-            member = await guild.fetch_member(payload.user_id)
-    except discord.NotFound:
-        return
-
-    if member.bot:
-        return
-
-    emoji = str(payload.emoji)
-    role_name = None
-    expected_title = None
-
-    # Find the matching role
-    for category in REACTION_ROLE_CATEGORIES.values():
-        if emoji in category["roles"]:
-            role_name = category["roles"][emoji]
-            expected_title = category["title"]
-            break
-
-    if role_name is None:
-        return
-
-    channel = bot.get_channel(payload.channel_id)
-    if channel is None:
-        return
-
-    try:
-        message = await channel.fetch_message(payload.message_id)
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        return
-
-    # Accept webhook messages with matching embed titles
-    is_role_panel = any(
-        embed.title == expected_title
-        for embed in message.embeds
-    )
-
-    if message.webhook_id is None or not is_role_panel:
-        return
-
-    role = discord.utils.get(guild.roles, name=role_name)
-
-    if role is None:
-        print(f"Role not found: {role_name}")
-        return
-
-    try:
-        await member.remove_roles(role, reason="Reaction role removed")
-    except discord.Forbidden:
-        print(f"Cannot remove {role_name} from {member.name}")
-    except discord.HTTPException as error:
-        print(f"Failed to remove {role_name}: {error}")
-
 # ========================= START BOT =========================
 
-bot.run(
-    token, log_handler=handler, log_level=logging.DEBUG)
+install_role_manager(bot)
+
+if __name__ == "__main__":
+    bot.run(
+        token, log_handler=handler, log_level=logging.DEBUG)
+ 
