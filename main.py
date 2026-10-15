@@ -69,23 +69,23 @@ async def on_member_join(member):
         await channel.send(f"Welcome {member.mention} to the server!")
 
 
-# @bot.event
-# async def on_message(message):
-#     if message.author.bot:
-#         return
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
 
-#     if "shit" in message.content.lower():
-#         try:
-#             await message.delete()
-#             await message.channel.send(
-#                 f"{message.author.mention}, please be respectful!"
-#             )
-#         except discord.Forbidden:
-#             print("Missing permission to delete messages.")
-#         except discord.HTTPException as error:
-#             print(f"Could not delete message: {error}")
+    if "niqqa" in message.content.lower():
+        try:
+            await message.delete()
+            await message.channel.send(
+                f"{message.author.mention}, please be respectful!"
+            )
+        except discord.Forbidden:
+            print("Missing permission to delete messages.")
+        except discord.HTTPException as error:
+            print(f"Could not delete message: {error}")
 
-#     await bot.process_commands(message)
+    await bot.process_commands(message)
 
 
 @bot.event
