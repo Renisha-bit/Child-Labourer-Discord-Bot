@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import logging
 import os
 import traceback
@@ -54,6 +55,7 @@ WELCOME_CHANNEL_ID = 1451964963085095044
 @bot.event
 async def on_ready():
     print(f"{bot.user} is working.")
+    print("Commands loaded: " + ", ".join(sorted(command.name for command in bot.commands)))
 
     # on_ready can fire again after a reconnect, so only (re)start the task if needed.
     global youtube_task
@@ -84,6 +86,8 @@ async def on_message(message):
             print("Missing permission to delete messages.")
         except discord.HTTPException as error:
             print(f"Could not delete message: {error}")
+        # Don't run commands from a message that was just removed for breaking the rules.
+        return
 
     await bot.process_commands(message)
 
@@ -91,14 +95,21 @@ async def on_message(message):
 @bot.event
 async def on_command_error(ctx, error):
     # Without this, every failed permission check dumps a traceback and the user gets no reply.
+    if ctx.command is not None and ctx.command.has_error_handler():
+        return  # that command reports its own errors (the role commands do)
+
     if isinstance(error, commands.CommandNotFound):
+        typed = (ctx.invoked_with or "").lower()
+        close = difflib.get_close_matches(typed, [command.name for command in bot.commands], n=1, cutoff=0.7)
+        if close:
+            await ctx.send(f"I don't know `{ctx.prefix}{typed}`. Did you mean `{ctx.prefix}{close[0]}`?")
         return
 
     if isinstance(error, commands.NoPrivateMessage):
         await ctx.send("That command only works inside a server.")
     elif isinstance(error, (commands.MissingPermissions, commands.CheckFailure)):
         await ctx.send("You don't have permission to use that command.")
-    elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+    elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)) and ctx.command is not None:
         usage = f"{ctx.prefix}{ctx.command.qualified_name} {ctx.command.signature}".strip()
         await ctx.send(f"Usage: `{usage}`")
     else:
@@ -411,4 +422,3 @@ install_role_manager(bot)
 if __name__ == "__main__":
     bot.run(
         token, log_handler=handler, log_level=logging.DEBUG)
- 
