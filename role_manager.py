@@ -406,30 +406,129 @@ def install_role_manager(bot: commands.Bot):
         prefix = "Created the role and " if created else "Reused the existing role and "
         await ctx.send(f"✅ {prefix}added {emoji} → **{role.name}** to **{category_name}**. {message}")
 
+    
+    
     @bot.command(name="roleremove")
     @commands.guild_only()
     @admin_only()
     async def roleremove(ctx: commands.Context, *, details: str):
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("❌ This command only works inside a server.")
+            return
+
         parts = [p.strip() for p in details.split("|", 1)]
         if len(parts) != 2 or not all(parts):
-            await ctx.send("Usage: `.roleremove <category> | <emoji>`\nThis removes the mapping, not the actual server role.")
+            await ctx.send(
+                "Usage: `.roleremove <category> | <emoji>`"
+            )
             return
+
         category_name, emoji = parts
         category = _get_category(category_name)
+
         if not category:
-            await ctx.send(f"❌ I couldn't find category **{category_name}**.")
+            await ctx.send(
+                f"❌ I couldn't find category **{category_name}**."
+            )
             return
+
         with _connect() as con:
-            cur = con.execute("DELETE FROM role_mappings WHERE category_id=? AND emoji=?", (category["id"], emoji))
-            removed = cur.rowcount
-        if not removed:
-            await ctx.send(f"❌ Emoji {emoji} isn't mapped in **{category_name}**.")
-            return
-        okay, message = await _sync_panel(bot, _get_category(category_name))
+            row = con.execute(
+                """
+                SELECT role_name FROM role_mappings
+                WHERE category_id = ? AND emoji = ?
+                """,
+                (category["id"], emoji),
+            ).fetchone()
+
+            if not row:
+                await ctx.send(
+                    f"❌ Emoji {emoji} isn't mapped in **{category_name}**."
+                )
+                return
+
+            role_name = row[0]
+
+            other_mapping = con.execute(
+                """
+                SELECT 1 FROM role_mappings
+                WHERE role_name = ?
+                  AND NOT (category_id = ? AND emoji = ?)
+                LIMIT 1
+                """,
+                (role_name, category["id"], emoji),
+            ).fetchone()
+
+            con.execute(
+                """
+                DELETE FROM role_mappings
+                WHERE category_id = ? AND emoji = ?
+                """,
+                (category["id"], emoji),
+            )
+
+        okay, message = await _sync_panel(
+            bot, _get_category(category_name)
+        )
+
         if not okay:
-            await ctx.send(f"⚠️ Removed the mapping from storage, but couldn't update the panel. Run `.rolepanel update {category_name}` to retry. {message}")
+            await ctx.send(
+                f"⚠️ Mapping removed, but panel update failed: {message}"
+            )
             return
-        await ctx.send(f"✅ Removed mapping {emoji} from **{category_name}**. The server role itself was kept. {message}")
+
+        if other_mapping:
+            await ctx.send(
+                f"✅ Removed {emoji} from **{category_name}**. "
+                f"Role **{role_name}** was kept because another category "
+                f"uses it. {message}"
+            )
+            return
+
+        role = discord.utils.get(guild.roles, name=role_name)
+
+        if role is None:
+            await ctx.send(
+                f"✅ Mapping removed. Role **{role_name}** was already "
+                f"missing. {message}"
+            )
+            return
+
+        me = guild.me
+        if me is None:
+            await ctx.send(
+                "⚠️ Mapping removed, but I couldn't verify the bot's "
+                "role hierarchy. Delete the role manually if needed."
+            )
+            return
+
+        if role.managed or role >= me.top_role:
+            await ctx.send(
+                f"⚠️ Mapping removed, but I couldn't delete **{role_name}**. "
+                f"Check role hierarchy and delete it manually if needed."
+            )
+            return
+
+        try:
+            await role.delete(
+                reason=f"Role mapping removed by {ctx.author}"
+            )
+            await ctx.send(
+                f"✅ Removed {emoji} from **{category_name}**.\n"
+                f"🗑️ Deleted server role **{role_name}**.\n"
+                f"✅ Panel updated successfully."
+            )
+        except discord.Forbidden:
+            await ctx.send(
+                f"⚠️ Panel updated, but Discord denied permission to "
+                f"delete **{role_name}**. Check Manage Roles and hierarchy."
+            )
+        except discord.HTTPException as error:
+            await ctx.send(
+                f"⚠️ Panel updated, but deleting **{role_name}** failed: "
+                f"{error}"
+            )
 
     @bot.command(name="roleedit")
     @commands.guild_only()
