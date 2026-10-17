@@ -48,14 +48,41 @@ youtube_task: Optional[asyncio.Task] = None
 
 # ========================= EVENTS =========================
 
+# Prints what the bot receives and what it does to THIS terminal, so you can see exactly where
+# a command stops working. Set to False once everything works.
+DEBUG_PRINTS = True
+
 WELCOME_CHANNEL_ID = 1451964963085095044
 # ↑ #welcome channel ID here
+
+
+def report_setup():
+    """Print the things that most often make role commands fail, once at startup."""
+    for guild in bot.guilds:
+        me = guild.me
+        perms = me.guild_permissions
+        print(
+            f"[setup] Server '{guild.name}': Manage Roles={'YES' if perms.manage_roles else 'NO'}, "
+            f"Administrator={'YES' if perms.administrator else 'no'}, my highest role='{me.top_role.name}'"
+        )
+    channel = bot.get_channel(ROLE_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        print(f"[setup] PROBLEM: ROLE_CHANNEL_ID {ROLE_CHANNEL_ID} is not a text channel I can see.")
+        return
+    channel_perms = channel.permissions_for(channel.guild.me)
+    needed = ("view_channel", "send_messages", "embed_links", "add_reactions", "read_message_history")
+    missing = [name for name in needed if not getattr(channel_perms, name)]
+    if missing:
+        print(f"[setup] PROBLEM: in #{channel.name} I'm missing: {', '.join(missing)}")
+    else:
+        print(f"[setup] Role channel #{channel.name}: permissions OK")
 
 
 @bot.event
 async def on_ready():
     print(f"{bot.user} is working.")
     print("Commands loaded: " + ", ".join(sorted(command.name for command in bot.commands)))
+    report_setup()
 
     # on_ready can fire again after a reconnect, so only (re)start the task if needed.
     global youtube_task
@@ -76,6 +103,9 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    if DEBUG_PRINTS and message.content.startswith("."):
+        print(f"[received] {message.author}: {message.content[:100]}")
+
     if "niqqa" in message.content.lower():
         try:
             await message.delete()
@@ -92,8 +122,20 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
+@bot.listen("on_command")
+async def log_command(ctx):
+    if DEBUG_PRINTS:
+        print(f"[command] {ctx.prefix}{ctx.command} run by {ctx.author}")
+
+
 @bot.event
 async def on_command_error(ctx, error):
+    if DEBUG_PRINTS:
+        if isinstance(error, commands.CommandNotFound):
+            print(f"[unknown command] {ctx.prefix}{ctx.invoked_with}  (this bot doesn't have that command)")
+        else:
+            print(f"[command error] {ctx.command}: {type(error).__name__}: {error}")
+
     # Without this, every failed permission check dumps a traceback and the user gets no reply.
     if ctx.command is not None and ctx.command.has_error_handler():
         return  # that command reports its own errors (the role commands do)
