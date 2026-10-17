@@ -1,1407 +1,639 @@
-"""Reaction-role & Interactive Button panels with Discord admin dashboard & Slash Commands.
+"""Database-driven reaction-role panels for Child Labourer.
 
-Integrate into the existing bot with:
-    from role_manager import ROLE_CHANNEL_ID, install_role_manager
-    install_role_manager(bot)
-
-How it works:
-  * Every category is ONE message posted by the bot in the designated role channel.
-  * Roles are presented with a rich Embed, Interactive UI Buttons, and Reaction Emojis.
-  * Adding a role to an existing category EDITS that message directly (adding the button and reaction).
-    Nothing is reposted, so existing reactions and messages stay in place.
-  * Adding a new category sends a brand new message to the designated channel.
-  * Users can click the interactive button OR react with the emoji to toggle roles.
-  * Fully persistent across bot restarts using discord.py's DynamicItem[Button].
-  * `.roleadd` creates the server role automatically if it doesn't exist yet.
-  * Every role command answers: ✅ on success, ❌ with the reason on failure, and the correct
-    usage + an example when the syntax is wrong.
-  * No webhooks are used anywhere.
-
-This module is the ONLY place that handles reaction roles and role buttons. main.py must not
-define its own reaction handlers or panel commands.
+Uses ordinary bot-authored Discord messages (no webhooks). Requires discord.py 2.x.
+Import install_role_manager(bot) from main.py and call it once before bot.run().
 """
-
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
 import sqlite3
-import traceback
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Optional
 
 import discord
-from discord import app_commands
 from discord.ext import commands
-from discord.ui import Button, DynamicItem, Item, View
 
-# Child of the "discord" logger so messages end up in discord.log too.
+ROLE_CHANNEL_ID = 1550216770156232834
+PANEL_COLOR = 0xC5B3D3
+DB_PATH = Path(__file__).resolve().parent / "role_manager.sqlite3"
 log = logging.getLogger("discord.role_manager")
 
-DB_PATH = Path(__file__).with_name("role_manager.sqlite3")
-ROLE_CHANNEL_ID = 1550216770156232834
-DEFAULT_COLOR = 0xC5B3D3
-MAX_REACTIONS = 20  # Discord limit of different reactions per message
-MAX_BUTTONS = 25    # Discord limit of buttons per message (5 rows of 5)
-
-BUTTON_STYLES = {
-    "primary": discord.ButtonStyle.primary,      # Blurple
-    "secondary": discord.ButtonStyle.secondary,  # Grey
-    "success": discord.ButtonStyle.success,      # Green
-    "danger": discord.ButtonStyle.danger,        # Red
-}
-
-INITIAL_CATEGORIES = {
-    "music": {
+# These are the user's current panels. Seeded only when the database is empty.
+DEFAULT_CATEGORIES = {
+    "Music": {
         "title": "🎵 MUSIC ROLES",
-        "color": DEFAULT_COLOR,
-        "roles": {
-            "🎧": "♩ Listener",
-            "🎸": "♫ Musician",
-            "🎛️": "𝄞 Producer",
-            "🎤": "♬ Vocalist",
-            "✍️": "♯ Songwriter",
-            "📀": "♭ DJ",
-        },
+        "description": "React below to choose your music roles.",
+        "roles": {"🎧": "♩ Listener", "🎸": "♫ Musician", "🎛️": "𝄞 Producer", "🎤": "♬ Vocalist", "✍️": "♯ Songwriter", "📀": "♭ DJ"},
     },
-    "notifications": {
+    "Notifications": {
         "title": "🔔 NOTIFICATION ROLES",
-        "color": DEFAULT_COLOR,
+        "description": "React to choose which notifications you want to receive.",
         "roles": {"🔔": "Upload Ping", "📢": "VC Ping"},
     },
-    "games": {
+    "Games": {
         "title": "🎮 GAME ROLES",
-        "color": DEFAULT_COLOR,
+        "description": "React below to choose your game roles.",
         "roles": {"⚔️": "Valorant", "⛏️": "Minecraft"},
     },
-    "colors": {
+    "Colors": {
         "title": "🎨 COLORS",
-        "color": DEFAULT_COLOR,
-        "roles": {
-            "🔴": "Red", "🟠": "Orange", "🟡": "Yellow", "🟢": "Green",
-            "🔵": "Blue", "🟣": "Purple", "🩷": "Pink", "⚪": "White", "⚫": "Black",
-        },
+        "description": "React below to choose a color role.",
+        "roles": {"🔴": "Red", "🟠": "Orange", "🟡": "Yellow", "🟢": "Green", "🔵": "Blue", "🟣": "Purple", "🩷": "Pink", "⚪": "White", "⚫": "Black"},
     },
 }
 
 
-# ========================= DATABASE =========================
-
-@contextmanager
-def _db():
-    """Open a connection, commit on success / roll back on error, and always close it."""
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    try:
-        with connection:
-            yield connection
-    finally:
-        connection.close()
+def _connect():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
 
 
-def _init_db() -> None:
-    with _db() as db:
-        db.execute("""CREATE TABLE IF NOT EXISTS categories (
-            key TEXT PRIMARY KEY, title TEXT NOT NULL, color INTEGER NOT NULL,
-            description TEXT NOT NULL DEFAULT '', footer TEXT NOT NULL DEFAULT '',
-            image_url TEXT NOT NULL DEFAULT '', thumbnail_url TEXT NOT NULL DEFAULT ''
-        )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS role_mappings (
-            category_key TEXT NOT NULL, emoji TEXT NOT NULL, role_name TEXT NOT NULL,
-            role_id INTEGER, style TEXT NOT NULL DEFAULT 'primary',
-            PRIMARY KEY (category_key, emoji),
-            FOREIGN KEY(category_key) REFERENCES categories(key) ON DELETE CASCADE
-        )""")
-        panel_table = """CREATE TABLE IF NOT EXISTS role_panels (
-            category_key TEXT PRIMARY KEY, channel_id INTEGER NOT NULL,
-            message_id INTEGER NOT NULL,
-            FOREIGN KEY(category_key) REFERENCES categories(key) ON DELETE CASCADE
-        )"""
-
-        # Upgrade from legacy versions if needed
-        columns = [row["name"] for row in db.execute("PRAGMA table_info(role_panels)")]
-        if "webhook_id" in columns:
-            db.execute("ALTER TABLE role_panels RENAME TO role_panels_old")
-            db.execute(panel_table)
-            db.execute(
-                "INSERT INTO role_panels(category_key, channel_id, message_id) "
-                "SELECT category_key, channel_id, message_id FROM role_panels_old"
-            )
-            db.execute("DROP TABLE role_panels_old")
-        else:
-            db.execute(panel_table)
-
-        # Ensure 'style' column exists in role_mappings
-        role_cols = [row["name"] for row in db.execute("PRAGMA table_info(role_mappings)")]
-        if "style" not in role_cols:
-            db.execute("ALTER TABLE role_mappings ADD COLUMN style TEXT NOT NULL DEFAULT 'primary'")
-
-        count = db.execute("SELECT COUNT(*) AS n FROM categories").fetchone()["n"]
+def _init_db():
+    with _connect() as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            color INTEGER NOT NULL DEFAULT 12956627,
+            panel_message_id INTEGER,
+            panel_channel_id INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS role_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+            emoji TEXT NOT NULL,
+            role_name TEXT NOT NULL,
+            UNIQUE(category_id, emoji),
+            UNIQUE(category_id, role_name COLLATE NOCASE)
+        );
+        """)
+        count = con.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
         if count == 0:
-            for key, category in INITIAL_CATEGORIES.items():
-                db.execute(
-                    "INSERT INTO categories(key, title, color) VALUES (?, ?, ?)",
-                    (key, category["title"], category["color"]),
+            for name, data in DEFAULT_CATEGORIES.items():
+                cur = con.execute(
+                    "INSERT INTO categories(name,title,description,color) VALUES(?,?,?,?)",
+                    (name, data["title"], data["description"], PANEL_COLOR),
                 )
-                for emoji, role_name in category["roles"].items():
-                    db.execute(
-                        "INSERT INTO role_mappings(category_key, emoji, role_name, style) VALUES (?, ?, ?, 'primary')",
-                        (key, emoji, role_name),
+                for emoji, role_name in data["roles"].items():
+                    con.execute(
+                        "INSERT INTO role_mappings(category_id,emoji,role_name) VALUES(?,?,?)",
+                        (cur.lastrowid, emoji, role_name),
                     )
 
 
-def _category(key: str):
-    with _db() as db:
-        return db.execute("SELECT * FROM categories WHERE key = ?", (key.lower().strip(),)).fetchone()
+def _get_categories():
+    with _connect() as con:
+        return [dict(r) for r in con.execute("SELECT * FROM categories ORDER BY id")]
 
 
-def _roles(category_key: str):
-    with _db() as db:
-        return db.execute(
-            "SELECT emoji, role_name, role_id, style FROM role_mappings WHERE category_key = ? ORDER BY rowid",
-            (category_key,),
-        ).fetchall()
+def _get_category(name: str):
+    with _connect() as con:
+        row = con.execute("SELECT * FROM categories WHERE name = ? COLLATE NOCASE", (name.strip(),)).fetchone()
+        return dict(row) if row else None
 
 
-def _all_categories():
-    with _db() as db:
-        return db.execute("SELECT * FROM categories ORDER BY rowid").fetchall()
+def _get_mappings(category_id: int):
+    with _connect() as con:
+        return [dict(r) for r in con.execute("SELECT * FROM role_mappings WHERE category_id=? ORDER BY id", (category_id,))]
 
 
-def _panel(category_key: str):
-    with _db() as db:
-        return db.execute("SELECT * FROM role_panels WHERE category_key = ?", (category_key,)).fetchone()
+def _set_panel(category_id: int, channel_id: int, message_id: int):
+    with _connect() as con:
+        con.execute("UPDATE categories SET panel_channel_id=?, panel_message_id=? WHERE id=?", (channel_id, message_id, category_id))
 
 
-def _save_panel(category_key: str, channel_id: int, message_id: int) -> None:
-    with _db() as db:
-        db.execute(
-            "INSERT INTO role_panels(category_key, channel_id, message_id) VALUES (?, ?, ?) "
-            "ON CONFLICT(category_key) DO UPDATE SET channel_id=excluded.channel_id, "
-            "message_id=excluded.message_id",
-            (category_key, channel_id, message_id),
-        )
-
-def _resolve_and_save_role_ids(guild: Optional[discord.Guild], category_key: str) -> None:
-    """Finds matching server roles by name/id and caches role_id in SQLite."""
-    if guild is None:
-        return
-    rows = _roles(category_key)
-    with _db() as db:
-        for row in rows:
-            role = None
-            if row["role_id"]:
-                role = guild.get_role(int(row["role_id"]))
-            if not role:
-                role = discord.utils.find(lambda r: r.name.casefold() == row["role_name"].casefold(), guild.roles)
-            if role and role.id != row["role_id"]:
-                db.execute(
-                    "UPDATE role_mappings SET role_id = ? WHERE category_key = ? AND emoji = ?",
-                    (role.id, category_key, row["emoji"]),
-                )
-
-# ========================= HELPERS =========================
-
-def _norm_emoji(value: str) -> str:
-    """Ignore variation selectors so emoji comparisons match cleanly."""
-    return value.replace("\ufe0f", "").strip()
+def _valid_emoji(emoji: str) -> bool:
+    # Custom emoji notation, unicode emoji and composed emoji sequences are accepted.
+    return bool(emoji and emoji.strip() and len(emoji) <= 100)
 
 
-def _find_mapping(category_key: str, emoji: str):
-    wanted = _norm_emoji(emoji)
-    for row in _roles(category_key):
-        if _norm_emoji(row["emoji"]) == wanted:
-            return row
-    return None
-
-
-def parse_emoji(emoji_str: Optional[str]) -> Optional[Union[str, discord.PartialEmoji]]:
-    """Parses unicode or custom Discord emojis."""
-    if not emoji_str:
-        return None
-    clean = emoji_str.strip()
-    if clean.startswith("<") and clean.endswith(">"):
-        try:
-            return discord.PartialEmoji.from_str(clean)
-        except Exception:
-            return clean
-    return clean
-
-
-def _parse_color(color_hex: str) -> Optional[int]:
-    raw = color_hex.strip().lstrip("#")
-    if len(raw) not in (3, 6):
-        return None
-    try:
-        if len(raw) == 3:
-            raw = "".join(ch * 2 for ch in raw)
-        return int(raw, 16)
-    except ValueError:
-        return None
-
-
-def _find_guild_role(guild: Optional[discord.Guild], query: str) -> Optional[discord.Role]:
-    """Finds role by mention (<@&id>), numeric ID, or case-insensitive name."""
-    if guild is None:
-        return None
-    clean = query.strip()
-    if clean.startswith("<@&") and clean.endswith(">"):
-        try:
-            return guild.get_role(int(clean[3:-1]))
-        except ValueError:
-            pass
-    if clean.isdigit():
-        role = guild.get_role(int(clean))
-        if role:
-            return role
-    for role in guild.roles:
-        if role.name.casefold() == clean.casefold():
-            return role
-    return None
-
-def _role_description(category_key: str) -> str:
-    rows = _roles(category_key)
-    if not rows:
-        return "No roles have been added to this category yet."
-    return "\n".join(f"{row['emoji']} — **{row['role_name']}**" for row in rows)
-
-
-def _make_embed(category_key: str) -> discord.Embed:
-    category = _category(category_key)
-    embed = discord.Embed(
-        title=category["title"],
-        description=_role_description(category_key),
-        color=int(category["color"]),
-    )
-    if category["footer"]:
-        embed.set_footer(text=category["footer"])
+def _panel_embed(category: dict, mappings: list[dict]) -> discord.Embed:
+    lines = []
+    for item in mappings:
+        lines.append(f"{item['emoji']} — **{discord.utils.escape_markdown(item['role_name'])}**")
+    description = category["description"].strip()
+    if lines:
+        description = (description + "\n\n" if description else "") + "\n".join(lines)
     else:
-        embed.set_footer(text="Click a button below or react with an emoji to toggle roles.")
-    if category["image_url"]:
-        embed.set_image(url=category["image_url"])
-    if category["thumbnail_url"]:
-        embed.set_thumbnail(url=category["thumbnail_url"])
+        description = (description + "\n\n" if description else "") + "*No roles have been added to this category yet.*"
+    embed = discord.Embed(title=category["title"], description=description, color=int(category["color"]))
+    embed.set_footer(text="React to add or remove a role.")
     return embed
 
 
-def _make_view(category_key: str, guild: Optional[discord.Guild] = None) -> View:
-    """Builds an interactive View with persistent buttons for each role.
+async def _find_panel(
+    bot: commands.Bot, category: dict
+) -> tuple[Optional[discord.TextChannel], Optional[discord.Message]]:
+    """Fetch a saved panel only from a normal guild text channel."""
+    channel_id = category.get("panel_channel_id")
+    message_id = category.get("panel_message_id")
+    if not channel_id or not message_id:
+        return None, None
 
-    Discord rejects a message whose buttons share a custom_id, so a role that can't be found
-    (or is listed twice) becomes a greyed-out placeholder instead of a second `role_toggle:0`.
-    """
-    view = View(timeout=None)
-    seen: set = set()
-    for index, row in enumerate(_roles(category_key)[:MAX_BUTTONS]):
-        role = None
-        if guild:
-            if row["role_id"]:
-                role = guild.get_role(int(row["role_id"]))
-            if not role:
-                role = discord.utils.find(lambda r: r.name.casefold() == row["role_name"].casefold(), guild.roles)
-
-        label = row["role_name"][:80]
-        emoji = parse_emoji(row["emoji"])
-        if role is None or role.id in seen:
-            view.add_item(Button(
-                label=label, emoji=emoji, style=discord.ButtonStyle.secondary,
-                disabled=True, custom_id=f"role_missing:{category_key}:{index}",
-            ))
-            continue
-        seen.add(role.id)
-        style = BUTTON_STYLES.get(row["style"] if "style" in row.keys() else "primary", discord.ButtonStyle.primary)
-        view.add_item(RoleToggleButton(role_id=role.id, label=label, style=style, emoji=emoji))
-    return view
-
-
-async def _get_channel(bot: commands.Bot, channel_id: int = ROLE_CHANNEL_ID) -> Optional[discord.TextChannel]:
-    """Return the text channel, or None if it can't be reached or isn't a text channel."""
-    channel = bot.get_channel(channel_id)
+    channel = bot.get_channel(int(channel_id))
     if channel is None:
         try:
-            channel = await bot.fetch_channel(channel_id)
+            fetched = await bot.fetch_channel(int(channel_id))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            return None
-    return channel if isinstance(channel, discord.TextChannel) else None
+            return None, None
+        if not isinstance(fetched, discord.TextChannel):
+            return None, None
+        channel = fetched
 
-
-def _ok(text: str) -> str:
-    return f"✅ {text}"
-
-
-def _fail(text: str) -> str:
-    return f"❌ {text}"
-
-
-def _category_list() -> str:
-    return ", ".join(f"`{row['key']}`" for row in _all_categories()) or "none yet"
-
-
-# (usage, example) for every prefix role command, shown when someone gets the syntax wrong.
-_USAGE = {
-    "roles": (".roles", ".roles"),
-    "rolecheck": (".rolecheck", ".rolecheck"),
-    "setup_roles": (".setup_roles", ".setup_roles"),
-    "rolecategories": (".rolecategories", ".rolecategories"),
-    "categoryadd": (".categoryadd <id> <#color> <title>", ".categoryadd art #C5B3D3 🎨 ART ROLES"),
-    "roleadd": (".roleadd <category> <emoji> <role name or @Role>", ".roleadd games 🎮 Terraria"),
-    "roleremove": (".roleremove <category> <emoji or role name>", ".roleremove games 🎮"),
-}
-
-
-def _usage_text(name: str) -> str:
-    usage, example = _USAGE.get(name, (f".{name}", f".{name}"))
-    text = f"**Usage:** `{usage}`\n**Example:** `{example}`"
-    if name in ("roleadd", "roleremove"):
-        text += f"\n**Categories:** {_category_list()}"
-    return text
-
-
-async def _role_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
-    """Every prefix role command answers here, so a mistake never ends in silence."""
-    name = ctx.command.name if ctx.command else ""
-    if isinstance(error, commands.NoPrivateMessage):
-        await ctx.send(_fail("That command only works inside a server."))
-    elif isinstance(error, commands.CheckFailure):
-        await ctx.send(_fail("You need the **Manage Roles** permission to use that command."))
-    elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument, commands.ArgumentParsingError)):
-        await ctx.send(_fail("That isn't the right format.\n" + _usage_text(name)))
-    else:
-        original = getattr(error, "original", error)
-        traceback.print_exception(type(original), original, original.__traceback__)
-        log.error("Error in .%s", name, exc_info=original)
-        await ctx.send(_fail("Something went wrong running that command. The details are in the bot's terminal."))
-
-
-_NO_CHANNEL = "I couldn't access the role panel channel. Check ROLE_CHANNEL_ID and my permissions."
-_NO_PERMS = "Missing permission. In the role channel I need: View Channel, Send Messages, Embed Links, Add Reactions and Read Message History."
-
-
-# ========================= PERSISTENT DYNAMIC BUTTON =========================
-
-class RoleToggleButton(DynamicItem[Button], template=r"role_toggle:(?P<role_id>[0-9]+)"):
-    """
-    Persistent button that responds to role clicks.
-    Remains functional across bot restarts automatically without polling or manual reloading.
-    """
-
-    def __init__(
-        self,
-        role_id: int,
-        label: str = "Role",
-        style: discord.ButtonStyle = discord.ButtonStyle.primary,
-        emoji: Optional[Union[str, discord.PartialEmoji]] = None,
-        row: Optional[int] = None,
-    ):
-        super().__init__(
-            Button(
-                label=label[:80],
-                style=style,
-                emoji=emoji,
-                custom_id=f"role_toggle:{role_id}",
-                row=row,
-            )
-        )
-        self.role_id = role_id
-
-    @classmethod
-    async def from_custom_id(
-        cls, interaction: discord.Interaction, item: Item[Any], match: re.Match[str], /
-    ):
-        role_id = int(match.group("role_id"))
-        btn_label = getattr(item, "label", None) or "Role"
-        btn_style = getattr(item, "style", discord.ButtonStyle.primary)
-        btn_emoji = getattr(item, "emoji", None)
-        return cls(
-            role_id=role_id,
-            label=btn_label,
-            style=btn_style,
-            emoji=btn_emoji,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        if not interaction.guild:
-            await interaction.followup.send(
-                "❌ This button can only be used inside a Discord server.", ephemeral=True
-            )
-            return
-
-        guild = interaction.guild
-        member = interaction.user
-        if not isinstance(member, discord.Member):
-            try:
-                member = await guild.fetch_member(interaction.user.id)
-            except discord.HTTPException:
-                await interaction.followup.send(
-                    "❌ Could not fetch your member information.", ephemeral=True
-                )
-                return
-
-        role = guild.get_role(self.role_id)
-        if not role:
-            await interaction.followup.send(
-                "❌ This role no longer exists in the server. Please inform an administrator.",
-                ephemeral=True,
-            )
-            return
-
-        bot_member = guild.me
-        if not bot_member.guild_permissions.manage_roles:
-            await interaction.followup.send(
-                "❌ I lack the **Manage Roles** permission to modify your roles.",
-                ephemeral=True,
-            )
-            return
-
-        if role >= bot_member.top_role:
-            await interaction.followup.send(
-                f"❌ I cannot assign or remove {role.mention} because it is positioned higher than (or equal to) my highest role ({bot_member.top_role.mention}) in Server Settings > Roles.",
-                ephemeral=True,
-            )
-            return
-
-        if role in member.roles:
-            try:
-                await member.remove_roles(role, reason="Role panel button toggle")
-                await interaction.followup.send(
-                    f"➖ Removed {role.mention} from your roles.",
-                    ephemeral=True,
-                )
-            except discord.Forbidden:
-                await interaction.followup.send(
-                    f"❌ Permission denied: Unable to remove {role.mention}.",
-                    ephemeral=True,
-                )
-            except Exception as e:
-                log.error("Error removing role %s: %s", role.id, e)
-                await interaction.followup.send(f"❌ An error occurred: {e}", ephemeral=True)
-        else:
-            try:
-                await member.add_roles(role, reason="Role panel button toggle")
-                await interaction.followup.send(
-                    f"➕ Added {role.mention} to your roles!",
-                    ephemeral=True,
-                )
-            except discord.Forbidden:
-                await interaction.followup.send(
-                    f"❌ Permission denied: Unable to assign {role.mention}.",
-                    ephemeral=True,
-                )
-            except Exception as e:
-                log.error("Error adding role %s: %s", role.id, e)
-                await interaction.followup.send(f"❌ An error occurred: {e}", ephemeral=True)
-
-
-# ========================= PANEL MESSAGES =========================
-
-async def _panel_state(bot: commands.Bot, key: str):
-    """Inspects a category's saved panel message."""
-    panel = _panel(key)
-    if panel is None:
-        return "none", None
-    channel = await _get_channel(bot, int(panel["channel_id"]))
-    if channel is None:
-        return "missing", None
-    try:
-        message = await channel.fetch_message(int(panel["message_id"]))
-    except discord.NotFound:
-        return "missing", None
-    if bot.user is None or message.author.id != bot.user.id:
-        return "foreign", message
-    return "ok", message
-
-
-async def _find_panels(bot: commands.Bot, channel: discord.TextChannel):
-    """Discover panels already in the channel by embed title."""
-    title_to_key = {row["title"]: row["key"] for row in _all_categories()}
-    bot_id = bot.user.id if bot.user else 0
-    found: dict = {}
-    old: dict = {}
-    notes: list = []
-    async for message in channel.history(limit=1000, oldest_first=False):
-        if not message.embeds:
-            continue
-        key = title_to_key.get(message.embeds[0].title)
-        if key is None:
-            continue
-        if message.author.id == bot_id:
-            if key in found:
-                notes.append(f"{key}: found another copy (message `{message.id}`); left untouched")
-            else:
-                found[key] = message
-        else:
-            old.setdefault(key, message)
-    return found, old, notes
-
-
-async def _post_panel(channel: discord.TextChannel, key: str) -> discord.Message:
-    """Post a new panel message with embed, interactive buttons, and reaction emojis."""
-    guild = channel.guild
-    _resolve_and_save_role_ids(guild, key)
-
-    embed = _make_embed(key)
-    view = _make_view(key, guild)
-
-    message = await channel.send(embed=embed, view=view)
-    _save_panel(key, channel.id, message.id)
-
-    # Also add reaction emojis for users who prefer reactions
-    for row in _roles(key):
-        try:
-            emoji = parse_emoji(row["emoji"])
-            if emoji:
-                await message.add_reaction(emoji)
-                await asyncio.sleep(0.3)
-        except Exception:
-            pass
-    return message
-
-
-async def _ensure_panel(bot: commands.Bot, key: str, scan: Optional[dict] = None) -> tuple[str, str]:
-    """Ensures a category has a working panel message."""
-    panel = _panel(key)
-    channel_id = int(panel["channel_id"]) if panel else ROLE_CHANNEL_ID
-    channel = await _get_channel(bot, channel_id)
-    if channel is None:
-        return "error", _NO_CHANNEL
+    # A saved panel should be in a TextChannel; ForumChannel and category
+    # objects do not expose fetch_message().
+    if not isinstance(channel, discord.TextChannel):
+        return None, None
 
     try:
-        state, _message = await _panel_state(bot, key)
-        if state == "ok":
-            return "ok", ""
-        if scan is None:
-            scan = {}
-        if "result" not in scan:
-            scan["result"] = await _find_panels(bot, channel)
-        found, old, _notes = scan["result"]
-        if key in found:
-            _save_panel(key, channel.id, found[key].id)
-            return "linked", f"linked existing panel (message `{found[key].id}`)"
-        message = await _post_panel(channel, key)
-        if key in old:
-            return "created", (
-                f"posted a new panel (message `{message.id}`). The older panel {old[key].jump_url} "
-                "was an old message and can be deleted."
-            )
-        return "created", f"posted a new panel (message `{message.id}`)"
-    except discord.Forbidden:
-        return "error", _NO_PERMS
-    except discord.HTTPException as exc:
-        return "error", f"Discord error: {exc}"
+        message = await channel.fetch_message(int(message_id))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return channel, None
+    return channel, message
 
 
-async def _update_existing_panel(bot: commands.Bot, key: str) -> tuple[bool, str]:
-    """Updates the existing panel message's embed and interactive buttons."""
-    try:
-        state, message = await _panel_state(bot, key)
-        if state != "ok" or message is None:
-            return False, "I couldn't find my panel message for that category. Run `.setup_roles`."
-
-        guild = message.guild
-        _resolve_and_save_role_ids(guild, key)
-
-        if message.embeds:
-            embed = discord.Embed.from_dict(message.embeds[0].to_dict())
-            embed.description = _role_description(key)
-            if not embed.footer.text:
-                embed.set_footer(text="Click a button below or react with an emoji to toggle roles.")
-        else:
-            embed = _make_embed(key)
-
-        view = _make_view(key, guild)
-        await message.edit(embed=embed, view=view)
-        return True, "Updated the panel message."
-    except discord.Forbidden:
-        return False, _NO_PERMS
-    except discord.HTTPException as exc:
-        return False, f"Discord couldn't update the panel: {exc}"
-
-
-async def _sync_panel(bot: commands.Bot, key: str) -> tuple[bool, str, bool]:
-    """Ensure the panel exists, then update embed and buttons to match the database."""
-    status, detail = await _ensure_panel(bot, key)
-    if status == "error":
-        return False, detail, False
-    if status == "created":
-        return True, f"The panel was missing, so I {detail}.", True
-    ok, message = await _update_existing_panel(bot, key)
-    if ok and status == "linked":
-        message = f"I {detail} first. {message}"
-    return ok, message, False
-
-
-async def _setup_panels(bot: commands.Bot) -> str:
-    """Safe, repeatable: posts missing panels and links existing ones."""
-    scan: dict = {}
-    working, linked, created, problems = [], [], [], []
-    for category in _all_categories():
-        key = category["key"]
-        status, detail = await _ensure_panel(bot, key, scan)
-        if status == "error" and detail == _NO_CHANNEL:
-            return detail
-        if status in ("ok", "linked"):
-            # Refresh buttons and embed on working/linked panels too
-            refreshed, refresh_detail = await _update_existing_panel(bot, key)
-            if not refreshed:
-                problems.append(f"{key}: {refresh_detail}")
-            elif status == "ok":
-                working.append(key)
-            else:
-                linked.append(key)
-        elif status == "created":
-            created.append(f"{key}: {detail}")
-        else:
-            problems.append(f"{key}: {detail}")
-    lines = [
-        f"**Already working:** {', '.join(working) or 'none'}",
-        f"**Linked existing panels:** {', '.join(linked) or 'none'}",
-        f"**Created new panels:** {'; '.join(created) or 'none'}",
-    ]
-    if problems:
-        lines += ["**Problems:**", *problems]
-    return "\n".join(lines)
-
-
-# ========================= ROLE / CATEGORY EDITING =========================
-
-async def _add_role(
+async def _sync_panel(
     bot: commands.Bot,
-    guild: Optional[discord.Guild],
-    category_key: str,
-    emoji: str,
-    role_query: str,
-    style: str = "primary",
-) -> str:
-    """Add a role to a category: edits the existing message to add a button and a reaction.
-
-    If the server has no role with that name yet, the role is created automatically.
-    """
-    if guild is None:
-        return _fail("This action can only be performed inside a server.")
-    category_key = category_key.lower().strip()
-    if _category(category_key) is None:
-        return _fail(f"There's no category called `{category_key}`. Existing categories: {_category_list()}.")
-    emoji = emoji.strip()
-    if not emoji:
-        return _fail("Please provide an emoji.")
-    role_query = role_query.strip()
-    if not role_query:
-        return _fail("Please provide a role name.")
-    if _find_mapping(category_key, emoji) is not None:
-        return _fail(f"Emoji {emoji} is already used in `{category_key}`. Remove that one first or pick another emoji.")
-    if len(_roles(category_key)) >= MAX_BUTTONS:
-        return _fail(f"Discord allows at most {MAX_BUTTONS} buttons on one message. Create another category instead.")
-
-    # Use the existing role, or create it.
-    role = _find_guild_role(guild, role_query)
-    created = False
-    if role is None:
-        if role_query.startswith("<@&") or (role_query.isdigit() and len(role_query) >= 17):
-            return _fail("I couldn't find a role with that mention/ID. Use the role's name to create a new one.")
-        if len(role_query) > 100:
-            return _fail("A role name can be at most 100 characters.")
-        if not guild.me.guild_permissions.manage_roles:
-            return _fail(f"There's no role named `{role_query}`, and I need the **Manage Roles** permission to create it.")
-        try:
-            role = await guild.create_role(name=role_query, reason=f"Created by .roleadd for category {category_key}")
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            return _fail(f"I couldn't create the role `{role_query}`: {exc}")
-        created = True
-    elif role.is_default() or role.managed:
-        return _fail(f"`{role.name}` can't be assigned (it's @everyone or managed by an integration).")
-    elif role >= guild.me.top_role:
-        return _fail(f"`{role.name}` is above or equal to my highest role ({guild.me.top_role.name}), so I couldn't assign it. Move my role higher in Server Settings > Roles first.")
-
-    if not created:
-        # Two buttons for the same role on one message would share a custom_id and Discord would reject it.
-        for row in _roles(category_key):
-            if (row["role_id"] and int(row["role_id"]) == role.id) or row["role_name"].casefold() == role.name.casefold():
-                return _fail(f"**{role.name}** is already in `{category_key}` (as {row['emoji']}). Remove it first to change its emoji.")
-    made = f"Created the role **{role.name}** and added" if created else "Added"
-
-    async def undo() -> None:
-        with _db() as db:
-            db.execute("DELETE FROM role_mappings WHERE category_key = ? AND emoji = ?", (category_key, emoji))
-        if created:  # don't leave a role behind from a failed command
-            try:
-                await role.delete(reason="Undoing a failed .roleadd")
-            except (discord.Forbidden, discord.HTTPException):
-                pass
-
-    with _db() as db:
-        db.execute(
-            "INSERT INTO role_mappings(category_key, emoji, role_name, role_id, style) VALUES (?, ?, ?, ?, ?)",
-            (category_key, emoji, role.name, role.id, style),
-        )
-
-    # 1) Edit the panel message to add the new button and update the embed
-    ok, message, rebuilt = await _sync_panel(bot, category_key)
-    if not ok:
-        await undo()
-        return _fail(message)
-    if rebuilt:  # a new panel was posted with every role, button and reaction already on it
-        return _ok(f"{made} {emoji} → **{role.name}** in `{category_key}`. {message}")
-
-    # 2) Add the reaction emoji to the same message. The button already works, so a failure here is only a warning.
-    reaction_problem = ""
-    try:
-        _state, panel_message = await _panel_state(bot, category_key)
-        parsed = parse_emoji(emoji)
-        if panel_message is None or not parsed:
-            reaction_problem = "I couldn't find the panel message"
-        else:
-            await panel_message.add_reaction(parsed)
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        reaction_problem = str(exc)
-    if reaction_problem:
-        log.warning("Could not add reaction emoji %s: %s", emoji, reaction_problem)
-        return _ok(
-            f"{made} {emoji} → **{role.name}** in `{category_key}` and edited the panel with the new button. "
-            f"⚠️ I couldn't add the reaction ({reaction_problem}), so only the button works for this role."
-        )
-    return _ok(f"{made} {emoji} → **{role.name}** in `{category_key}`. I edited the panel message with the new button and reaction.")
-
-
-async def _remove_role(bot: commands.Bot, category_key: str, emoji_or_role: str) -> str:
-    """Remove a role from a category: edits the panel message and clears the reaction."""
-    category_key = category_key.lower().strip()
-    if _category(category_key) is None:
-        return _fail(f"There's no category called `{category_key}`. Existing categories: {_category_list()}.")
-
-    # Search by emoji first, then by role name
-    old = _find_mapping(category_key, emoji_or_role)
-    if old is None:
-        clean = emoji_or_role.strip().casefold()
-        for row in _roles(category_key):
-            if row["role_name"].casefold() == clean:
-                old = row
-                break
-    if old is None:
-        return _fail(f"`{emoji_or_role}` isn't in `{category_key}`. Use `.rolecategories` to see what each category has.")
-
-    with _db() as db:
-        db.execute("DELETE FROM role_mappings WHERE category_key = ? AND emoji = ?", (category_key, old["emoji"]))
-
-    ok, message, rebuilt = await _sync_panel(bot, category_key)
-    if not ok:
-        with _db() as db:
-            db.execute(
-                "INSERT INTO role_mappings(category_key, emoji, role_name, role_id, style) VALUES (?, ?, ?, ?, ?)",
-                (category_key, old["emoji"], old["role_name"], old["role_id"], old["style"]),
-            )
-        return _fail(message)
-    if rebuilt:
-        return _ok(f"Removed {old['emoji']} ({old['role_name']}) from `{category_key}`. {message}")
-
-    try:
-        _state, panel_message = await _panel_state(bot, category_key)
-        if panel_message is not None:
-            parsed = parse_emoji(old["emoji"])
-            if parsed is not None:
-                try:
-                    await panel_message.clear_reaction(parsed)
-                except discord.Forbidden:  # no Manage Messages: at least remove my own reaction
-                    if bot.user is not None:
-                        await panel_message.remove_reaction(parsed, bot.user)
-    except (discord.Forbidden, discord.HTTPException):
-        pass
-
-    return _ok(
-        f"Removed {old['emoji']} ({old['role_name']}) from `{category_key}` and updated the panel buttons. "
-        "Members who already have that role keep it."
-    )
-
-
-async def _edit_panel_appearance(
-    bot: commands.Bot, category_key: str, title: str, color_hex: str, footer: str, image_url: str, thumbnail_url: str
-) -> str:
-    category_key = category_key.lower().strip()
-    category = _category(category_key)
+    category: Optional[dict],
+    *,
+    create_if_missing: bool = True,
+) -> tuple[bool, str]:
     if category is None:
-        return _fail(f"There's no category called `{category_key}`. Existing categories: {_category_list()}.")
-    color = _parse_color(color_hex)
-    if color is None:
-        return _fail("Enter a valid hex color, for example `#C5B3D3`.")
-    image_url, thumbnail_url, footer = image_url.strip(), thumbnail_url.strip(), footer.strip()
-    for label, url in (("image", image_url), ("thumbnail", thumbnail_url)):
-        if url and not url.lower().startswith(("https://", "http://")):
-            return _fail(f"The {label} must be an `https://` or `http://` URL, or left blank.")
+        return False, "I couldn't find that category in the saved configuration."
 
-    status, detail = await _ensure_panel(bot, category_key)
-    if status == "error":
-        return _fail(detail)
-    note = f"(The panel was missing, so I {detail}.) " if status in ("linked", "created") else ""
-    try:
-        _state, message = await _panel_state(bot, category_key)
-        if message is None:
-            return _fail("I couldn't find my panel message for that category. Run `.setup_roles`.")
+    channel, message = await _find_panel(bot, category)
 
-        guild = message.guild
-        embed = _make_embed(category_key)
-        embed.title = title.strip()[:256] or category["title"]
-        embed.color = discord.Color(color)
-        if footer:
-            embed.set_footer(text=footer[:2048])
-        else:
-            embed.set_footer(text="Click a button below or react with an emoji to toggle roles.")
-        # discord.py has no remove_image()/remove_thumbnail(); passing url=None clears them.
-        embed.set_image(url=image_url or None)
-        embed.set_thumbnail(url=thumbnail_url or None)
-
-        view = _make_view(category_key, guild)
-        await message.edit(embed=embed, view=view)
-
-        with _db() as db:
-            db.execute(
-                "UPDATE categories SET title = ?, color = ?, footer = ?, image_url = ?, thumbnail_url = ? WHERE key = ?",
-                (embed.title, color, footer[:2048], image_url, thumbnail_url, category_key),
-            )
-        return _ok(f"{note}Updated the `{category_key}` panel's appearance.")
-    except discord.Forbidden:
-        return _fail(_NO_PERMS)
-    except discord.HTTPException as exc:
-        return _fail(f"Discord couldn't update the panel: {exc}")
-
-
-async def _add_category(
-    bot: commands.Bot,
-    key: str,
-    title: str,
-    color_hex: str,
-    channel_id: Optional[int] = None,
-) -> str:
-    """Create a new category and send a brand new message."""
-    key = key.lower().strip()
-    if not key or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for ch in key):
-        return _fail("The category ID may only use lowercase letters, numbers, hyphens and underscores (no spaces).")
-    if _category(key):
-        return _fail(f"Category `{key}` already exists. Existing categories: {_category_list()}.")
-    color = _parse_color(color_hex)
-    if color is None:
-        return _fail("Enter a valid hex color, for example `#C5B3D3`.")
-
-    target_channel_id = channel_id or ROLE_CHANNEL_ID
-    channel = await _get_channel(bot, target_channel_id)
     if channel is None:
-        return _fail(_NO_CHANNEL)
-
-    title = title.strip()[:256] or f"{key.upper()} ROLES"
-    with _db() as db:
-        db.execute("INSERT INTO categories(key, title, color) VALUES (?, ?, ?)", (key, title, color))
-    try:
-        message = await _post_panel(channel, key)
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        if _panel(key) is None:  # nothing was posted, so don't leave a half-made category behind
-            with _db() as db:
-                db.execute("DELETE FROM categories WHERE key = ?", (key,))
-        return _fail(f"I couldn't post the category panel: {exc}. {_NO_PERMS}")
-
-    return _ok(
-        f"Created category `{key}` and sent a new message in {channel.mention}!\n"
-        f"[Jump to Message]({message.jump_url})\n"
-        f"Add roles to it with `.roleadd {key} 🎮 RoleName` or `/role-category add-role`."
-    )
-
-
-async def _delete_category(bot: commands.Bot, category_key: str, delete_message: bool = True) -> str:
-    """Deletes a category and optionally removes the Discord message."""
-    key = category_key.lower().strip()
-    category = _category(key)
-    if not category:
-        return _fail(f"Category `{key}` not found. Existing categories: {_category_list()}.")
-
-    panel = _panel(key)
-    if delete_message and panel:
-        channel = await _get_channel(bot, int(panel["channel_id"]))
-        if channel:
+        candidate = bot.get_channel(ROLE_CHANNEL_ID)
+        if candidate is None:
             try:
-                msg = await channel.fetch_message(int(panel["message_id"]))
-                await msg.delete()
+                candidate = await bot.fetch_channel(ROLE_CHANNEL_ID)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+                return False, (
+                    f"I can't access the configured role channel (`{ROLE_CHANNEL_ID}`). "
+                    "Check the channel ID and my permissions."
+                )
+        if not isinstance(candidate, discord.TextChannel):
+            return False, "The configured role channel isn't a regular text channel."
+        channel = candidate
 
-    with _db() as db:
-        db.execute("DELETE FROM categories WHERE key = ?", (key,))
+    if not isinstance(channel, discord.TextChannel):
+        return False, "The saved panel channel isn't a regular text channel."
 
-    return _ok(f"Category `{key}` has been deleted.")
+    me = channel.guild.me
+    if me is None and bot.user is not None:
+        me = channel.guild.get_member(bot.user.id)
+    if me is None:
+        return False, "I couldn't identify my bot member in this server. Try again after the bot reconnects."
 
-
-# ========================= DASHBOARD UI =========================
-
-class _SafeModal(discord.ui.Modal):
-    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        log.error("Role dashboard modal failed", exc_info=error)
-        text = "Something went wrong while doing that. Check the bot log for details."
-        if interaction.response.is_done():
-            await interaction.followup.send(text, ephemeral=True)
-        else:
-            await interaction.response.send_message(text, ephemeral=True)
-
-
-class AddRoleModal(_SafeModal, title="Add a role"):
-    category_key = discord.ui.TextInput(label="Category ID", placeholder="games", max_length=40)
-    emoji = discord.ui.TextInput(label="Reaction/Button emoji", placeholder="🎮", max_length=64)
-    role_name = discord.ui.TextInput(label="Role name or @Role (created if missing)", placeholder="Valorant", max_length=100)
-
-    def __init__(self, bot: commands.Bot):
-        super().__init__(timeout=180)
-        self.bot = bot
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            await interaction.response.send_message("Use this inside your server.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        result = await _add_role(
-            self.bot, interaction.guild, str(self.category_key), str(self.emoji), str(self.role_name)
+    perms = channel.permissions_for(me)
+    missing = [
+        name
+        for name, okay in (
+            ("View Channel", perms.view_channel),
+            ("Send Messages", perms.send_messages),
+            ("Embed Links", perms.embed_links),
+            ("Add Reactions", perms.add_reactions),
+            ("Read Message History", perms.read_message_history),
         )
-        await interaction.followup.send(result, ephemeral=True)
+        if not okay
+    ]
+    if missing:
+        return False, "Missing permissions in the role channel: " + ", ".join(missing) + "."
 
+    embed = _panel_embed(category, _get_mappings(category["id"]))
 
-class RemoveRoleModal(_SafeModal, title="Remove a role mapping"):
-    category_key = discord.ui.TextInput(label="Category ID", placeholder="games", max_length=40)
-    emoji_or_role = discord.ui.TextInput(label="Emoji or Role Name to remove", placeholder="🎮 or Valorant", max_length=100)
-
-    def __init__(self, bot: commands.Bot):
-        super().__init__(timeout=180)
-        self.bot = bot
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        result = await _remove_role(self.bot, str(self.category_key), str(self.emoji_or_role))
-        await interaction.followup.send(result, ephemeral=True)
-
-
-class AddCategoryModal(_SafeModal, title="Create a role category"):
-    key = discord.ui.TextInput(label="Category ID (no spaces)", placeholder="art", max_length=40)
-    title_text = discord.ui.TextInput(label="Panel title", placeholder="🎨 ART ROLES", max_length=256)
-    color = discord.ui.TextInput(label="Embed color (hex)", placeholder="#C5B3D3", default="#C5B3D3", max_length=7)
-
-    def __init__(self, bot: commands.Bot):
-        super().__init__(timeout=180)
-        self.bot = bot
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        result = await _add_category(self.bot, str(self.key), str(self.title_text), str(self.color))
-        await interaction.followup.send(result, ephemeral=True)
-
-
-class PanelAppearanceModal(_SafeModal, title="Customize a role panel"):
-    category_key = discord.ui.TextInput(label="Category ID", placeholder="games", max_length=40)
-    title_text = discord.ui.TextInput(label="Embed title", placeholder="🎮 GAME ROLES", max_length=256)
-    color = discord.ui.TextInput(label="Embed color (hex)", placeholder="#C5B3D3", default="#C5B3D3", max_length=7)
-    footer = discord.ui.TextInput(label="Footer (optional)", placeholder="Leave blank for default", required=False, max_length=2048)
-    image_url = discord.ui.TextInput(label="Image URL (optional)", placeholder="https://...", required=False, max_length=400)
-
-    def __init__(self, bot: commands.Bot):
-        super().__init__(timeout=180)
-        self.bot = bot
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        existing = _category(str(self.category_key))
-        thumbnail_url = existing["thumbnail_url"] if existing else ""
-        result = await _edit_panel_appearance(
-            self.bot, str(self.category_key), str(self.title_text), str(self.color),
-            str(self.footer), str(self.image_url), thumbnail_url
+    # Webhook-authored messages cannot be edited by the bot account.
+    # Leave them untouched and create a normal bot-authored replacement.
+    if message is not None and message.webhook_id is not None:
+        log.info(
+            "Saved panel for %s is webhook-authored; creating a normal bot message instead.",
+            category["name"],
         )
-        await interaction.followup.send(result, ephemeral=True)
+        message = None
 
-
-class RoleDashboardView(discord.ui.View):
-    def __init__(self, bot: commands.Bot):
-        super().__init__(timeout=300)
-        self.bot = bot
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        perms = getattr(interaction.user, "guild_permissions", None)
-        if perms is None or not (perms.manage_roles or perms.manage_guild or perms.administrator):
-            await interaction.response.send_message("You need Manage Roles permission to use this dashboard.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="Add role", style=discord.ButtonStyle.success, emoji="➕")
-    async def add_role(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AddRoleModal(self.bot))
-
-    @discord.ui.button(label="Remove role", style=discord.ButtonStyle.danger, emoji="➖")
-    async def remove_role(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RemoveRoleModal(self.bot))
-
-    @discord.ui.button(label="Add category", style=discord.ButtonStyle.primary, emoji="🗂️")
-    async def add_category(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AddCategoryModal(self.bot))
-
-    @discord.ui.button(label="Sync panels", style=discord.ButtonStyle.secondary, emoji="🔎")
-    async def sync_panels(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        result = await _setup_panels(self.bot)
-        await interaction.followup.send(f"{result}\n\nCommand: `.setup_roles`"[:1900], ephemeral=True)
-
-    @discord.ui.button(label="Customize panel", style=discord.ButtonStyle.primary, emoji="🎨")
-    async def customize_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(PanelAppearanceModal(self.bot))
-
-    @discord.ui.button(label="Show categories", style=discord.ButtonStyle.secondary, emoji="📋")
-    async def show_categories(self, interaction: discord.Interaction, button: discord.ui.Button):
-        lines = []
-        for row in _all_categories():
-            status = "has panel" if _panel(row["key"]) else "no panel yet — press Sync panels"
-            lines.append(f"**{row['title']}** · ID: `{row['key']}` · {len(_roles(row['key']))} roles · {status}")
-        embed = discord.Embed(title="Role categories", description="\n".join(lines) or "No categories yet.", color=DEFAULT_COLOR)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# ========================= SLASH COMMAND GROUP =========================
-
-def _create_slash_commands(bot: commands.Bot) -> app_commands.Group:
-    role_group = app_commands.Group(
-        name="role-category",
-        description="Create and manage interactive role category menus with buttons",
-        default_permissions=discord.Permissions(manage_roles=True),
-        guild_only=True,
-    )
-
-    async def category_autocomplete(
-        interaction: discord.Interaction, current: str
-    ) -> List[app_commands.Choice[str]]:
-        current_lower = current.strip().lower()
-        return [
-            app_commands.Choice(name=f"{row['key']} ({row['title']})", value=row["key"])
-            for row in _all_categories()
-            if current_lower in row["key"].lower() or current_lower in row["title"].lower()
-        ][:25]
-
-    @role_group.command(name="create", description="Create a new category and send a new message")
-    @app_commands.describe(
-        name="Unique identifier (e.g., 'gaming', 'notifications', 'colors')",
-        title="Title shown at top of the embed",
-        channel="Optional channel to post in (defaults to configured role channel)",
-        color="Optional embed color hex (e.g. #C5B3D3 or #5865F2)",
-    )
-    async def slash_create(
-        interaction: discord.Interaction,
-        name: str,
-        title: str,
-        channel: Optional[discord.TextChannel] = None,
-        color: Optional[str] = "#C5B3D3",
-    ):
-        await interaction.response.defer(ephemeral=True)
-        channel_id = channel.id if channel else ROLE_CHANNEL_ID
-        result = await _add_category(bot, name, title, color or "#C5B3D3", channel_id=channel_id)
-        await interaction.followup.send(result, ephemeral=True)
-
-    @role_group.command(name="add-role", description="Add a role button to an existing category message")
-    @app_commands.autocomplete(category=category_autocomplete)
-    @app_commands.describe(
-        category="The category to add this role to",
-        role="The server role to assign when clicked",
-        emoji="Emoji to display on the button and add as reaction (e.g. 🎮 or custom <:name:id>)",
-        button_color="Button style color",
-    )
-    @app_commands.choices(
-        button_color=[
-            app_commands.Choice(name="Blurple (Primary)", value="primary"),
-            app_commands.Choice(name="Grey (Secondary)", value="secondary"),
-            app_commands.Choice(name="Green (Success)", value="success"),
-            app_commands.Choice(name="Red (Danger)", value="danger"),
-        ]
-    )
-    async def slash_add_role(
-        interaction: discord.Interaction,
-        category: str,
-        role: discord.Role,
-        emoji: str,
-        button_color: Optional[app_commands.Choice[str]] = None,
-    ):
-        await interaction.response.defer(ephemeral=True)
-        if interaction.guild is None:
-            await interaction.followup.send("❌ This command can only be used inside a server.", ephemeral=True)
-            return
-        style = button_color.value if button_color else "primary"
-        result = await _add_role(bot, interaction.guild, category, emoji, role.name, style=style)
-        await interaction.followup.send(result, ephemeral=True)
-
-    @role_group.command(name="remove-role", description="Remove a role button from an existing category message")
-    @app_commands.autocomplete(category=category_autocomplete)
-    @app_commands.describe(
-        category="The category to remove the role from",
-        role="The role to remove",
-    )
-    async def slash_remove_role(
-        interaction: discord.Interaction,
-        category: str,
-        role: discord.Role,
-    ):
-        await interaction.response.defer(ephemeral=True)
-        result = await _remove_role(bot, category, role.name)
-        await interaction.followup.send(result, ephemeral=True)
-
-    @role_group.command(name="list", description="List all configured role categories and panel links")
-    async def slash_list(interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        categories = _all_categories()
-        if not categories:
-            await interaction.followup.send("No categories configured yet.", ephemeral=True)
-            return
-
-        embed = discord.Embed(title="📋 Configured Role Categories", color=DEFAULT_COLOR)
-        for cat in categories:
-            panel = _panel(cat["key"])
-            roles = _roles(cat["key"])
-            roles_text = ", ".join([f"{r['emoji']} {r['role_name']}" for r in roles]) if roles else "*None*"
-            msg_link = f"https://discord.com/channels/{interaction.guild_id}/{panel['channel_id']}/{panel['message_id']}" if panel else "*No panel yet*"
-            embed.add_field(
-                name=f"{cat['title']} (`{cat['key']}`)",
-                value=f"• **Roles ({len(roles)}):** {roles_text}\n• **Panel:** {msg_link}",
-                inline=False,
-            )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    @role_group.command(name="resend", description="Re-post a category message to a channel")
-    @app_commands.autocomplete(category=category_autocomplete)
-    @app_commands.describe(
-        category="The category to re-post",
-        channel="The channel to post the message into",
-    )
-    async def slash_resend(
-        interaction: discord.Interaction,
-        category: str,
-        channel: discord.TextChannel,
-    ):
-        await interaction.response.defer(ephemeral=True)
-        clean_cat = category.strip().lower()
-        if not _category(clean_cat):
-            await interaction.followup.send(f"❌ Category `{category}` not found.", ephemeral=True)
-            return
+    if message is not None:
         try:
-            msg = await _post_panel(channel, clean_cat)
-            await interaction.followup.send(
-                f"✅ Re-posted `{clean_cat}` in {channel.mention}!\n[Jump to Message]({msg.jump_url})",
-                ephemeral=True,
-            )
-        except Exception as e:
-            await interaction.followup.send(f"❌ Could not post message: {e}", ephemeral=True)
-
-    @role_group.command(name="delete", description="Delete a category from the database")
-    @app_commands.autocomplete(category=category_autocomplete)
-    @app_commands.describe(
-        category="Category to delete",
-        delete_message="Whether to delete the Discord message",
-    )
-    async def slash_delete(
-        interaction: discord.Interaction,
-        category: str,
-        delete_message: bool = True,
-    ):
-        await interaction.response.defer(ephemeral=True)
-        result = await _delete_category(bot, category, delete_message=delete_message)
-        await interaction.followup.send(result, ephemeral=True)
-
-    return role_group
-
-
-# ========================= REACTION HANDLING =========================
-
-async def _resolve_reaction(bot: commands.Bot, payload: discord.RawReactionActionEvent):
-    """Turn a raw reaction event into (member, role), or None to ignore it."""
-    if payload.guild_id is None or (bot.user and payload.user_id == bot.user.id):
-        return None
-    with _db() as db:
-        panel = db.execute("SELECT category_key FROM role_panels WHERE message_id = ?", (payload.message_id,)).fetchone()
-    if panel is None:
-        return None
-    mapping = _find_mapping(panel["category_key"], str(payload.emoji))
-    if mapping is None:
-        return None
-    guild = bot.get_guild(payload.guild_id)
-    if guild is None:
-        return None
-    role = guild.get_role(int(mapping["role_id"])) if mapping["role_id"] else None
-    if role is None:
-        role = discord.utils.find(lambda r: r.name.casefold() == mapping["role_name"].casefold(), guild.roles)
-    if role is None:
-        log.warning("Role not found for %s: %s", mapping["emoji"], mapping["role_name"])
-        return None
-    if role.is_default() or role.managed or role >= guild.me.top_role:
-        log.warning("Can't manage role %s (default, managed, or above top role)", role.name)
-        return None
-    member = guild.get_member(payload.user_id)
-    if member is None:
+            await message.edit(embed=embed)
+        except discord.Forbidden:
+            return False, "I can see the existing panel but can't edit it. Check message permissions."
+        except discord.HTTPException as exc:
+            return False, f"Discord wouldn't let me edit the panel: {exc}"
+    elif create_if_missing:
         try:
-            member = await guild.fetch_member(payload.user_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            return None
-    if member.bot:
-        return None
-    return member, role
+            message = await channel.send(embed=embed)
+            _set_panel(category["id"], channel.id, message.id)
+        except discord.Forbidden:
+            return False, "I don't have permission to send the role panel in the role channel."
+        except discord.HTTPException as exc:
+            return False, f"Discord wouldn't let me create the panel: {exc}"
+    else:
+        return False, "The saved panel message is missing. Run `.rolesetup` to create a replacement."
+
+    for item in _get_mappings(category["id"]):
+        try:
+            await message.add_reaction(item["emoji"])
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("Panel updated but couldn't add reaction %s: %s", item["emoji"], exc)
+            return True, (
+                f"Panel updated, but I couldn't add reaction {item['emoji']}. "
+                "Check that emoji and Add Reactions permission."
+            )
+    return True, "Panel updated successfully."
 
 
-# ========================= MAIN INSTALLER =========================
+def _admin_check():
+    return commands.has_guild_permissions(manage_roles=True)
 
-def install_role_manager(bot: commands.Bot) -> None:
-    """Register role commands, dynamic persistent buttons, and reaction handlers."""
+
+def install_role_manager(bot: commands.Bot):
+    """Register the dynamic reaction-role system on the supplied bot."""
     _init_db()
 
-    # Register the dynamic item template for interactive buttons
-    bot.add_dynamic_items(RoleToggleButton)
+    def admin_only():
+        return commands.has_guild_permissions(manage_roles=True)
 
-    # Register slash command group
-    role_group = _create_slash_commands(bot)
-    try:
-        bot.tree.add_command(role_group)
-    except Exception as exc:
-        log.warning("Could not add slash command group to tree: %s", exc)
-
-    # Sync slash commands once. on_ready fires again after every reconnect, and re-syncing each
-    # time wastes Discord's (strict) command-sync rate limit.
-    slash_synced = False
-
-    @bot.listen("on_ready")
-    async def _on_role_manager_ready():
-        nonlocal slash_synced
-        if slash_synced:
-            return
-        try:
-            synced = await bot.tree.sync()
-            slash_synced = True
-            print(f"Role manager synced {len(synced)} slash command(s).")
-        except Exception as exc:
-            log.warning("Could not sync slash commands: %s", exc)
-            print(f"Could not sync slash commands: {exc}")
-
-    # --- Prefix Commands ---
-
-    @bot.command(name="roles", help="Open the interactive role-management dashboard.")
+    @bot.command(name="roles")
     @commands.guild_only()
-    @commands.has_guild_permissions(manage_roles=True)
+    @admin_only()
     async def roles_dashboard(ctx: commands.Context):
-        embed = discord.Embed(
-            title="ChildLaborer · Role Control Centre",
-            description=(
-                "Manage role panels with interactive buttons and reactions.\n\n"
-                "**Dashboard actions**\n"
-                "➕ Add role · ➖ Remove role · 🗂️ Add category\n"
-                "🎨 Customize panel · 🔎 Sync panels · 📋 Show categories\n\n"
-                "**Prefix commands**\n"
-                "`.setup_roles` — post or update all category panels with buttons\n"
-                "`.rolecheck` — diagnose permissions and panels\n"
-                "`.rolecategories` — list categories\n"
-                "`.categoryadd <id> <#color> <title>` — add a new category (sends new message)\n"
-                "`.roleadd <category> <emoji> <role>` — add a role to a category (creates the role if it doesn't exist)\n"
-                "`.roleremove <category> <emoji_or_role>` — remove a role\n\n"
-                "**Slash commands**\n"
-                "Use `/role-category` for full autocomplete-enabled slash commands!\n"
-            ),
-            color=DEFAULT_COLOR,
-        )
-        await ctx.send(embed=embed, view=RoleDashboardView(bot))
+        cats = _get_categories()
+        embed = discord.Embed(title="Role Manager", description="Manage reaction-role categories and mappings with commands below. Panels are ordinary bot messages—no webhooks.", color=PANEL_COLOR)
+        embed.add_field(name="Categories", value="\n".join(f"• **{c['name']}** — {len(_get_mappings(c['id']))} roles" for c in cats) or "None", inline=False)
+        embed.add_field(name="Setup / repair", value="`.rolesetup` — create missing panels and sync reactions\n`.rolepanel update <category>` — update one panel", inline=False)
+        embed.add_field(name="Categories", value="`.rolecategory add <name>`\n`.rolecategory rename <old> | <new>`\n`.rolecategory remove <name>`", inline=False)
+        embed.add_field(name="Roles", value="`.roleadd <category> | <emoji> | <role name>`\n`.roleremove <category> | <emoji>`\n`.roleedit <category> | <old emoji> | <new emoji> | <role name>`", inline=False)
+        embed.add_field(name="Appearance", value="`.rolepanel title <category> | <new title>`\n`.rolepanel description <category> | <description>`\n`.rolepanel color <category> | #C5B3D3`", inline=False)
+        embed.set_footer(text="Manage Roles permission required. The bot role must be above roles it assigns.")
+        await ctx.send(embed=embed)
 
-    @bot.command(name="rolecheck", help="Diagnose the role panel setup: channel, permissions, saved panels.")
+    @bot.command(name="rolesetup")
     @commands.guild_only()
-    @commands.has_guild_permissions(manage_roles=True)
-    async def rolecheck(ctx: commands.Context):
-        channel = await _get_channel(bot)
-        if channel is None:
-            await ctx.send(f"{_NO_CHANNEL} (ROLE_CHANNEL_ID is `{ROLE_CHANNEL_ID}`)")
+    @admin_only()
+    async def rolesetup(ctx: commands.Context):
+        await ctx.send("Starting role-panel setup. I'll create any missing category panels and sync their reactions; existing saved panels will be edited in place.")
+        results = []
+        for category in _get_categories():
+            okay, message = await _sync_panel(bot, category, create_if_missing=True)
+            results.append(f"{'✅' if okay else '❌'} **{category['name']}**: {message}")
+        await ctx.send("\n".join(results))
+
+    @bot.command(name="rolecategory")
+    @commands.guild_only()
+    @admin_only()
+    async def rolecategory(ctx: commands.Context, action: str, *, details: str):
+        action = action.lower().strip()
+        if action == "add":
+            name = details.strip()
+            if not name or len(name) > 80:
+                await ctx.send("❌ Category name must be between 1 and 80 characters.")
+                return
+            if _get_category(name):
+                await ctx.send(f"❌ Category **{name}** already exists.")
+                return
+            title = name.upper()
+            with _connect() as con:
+                cur = con.execute("INSERT INTO categories(name,title,description,color) VALUES(?,?,?,?)", (name, title, "React below to choose your roles.", PANEL_COLOR))
+                category_id = cur.lastrowid
+            category = next(c for c in _get_categories() if c["id"] == category_id)
+            okay, message = await _sync_panel(bot, category, create_if_missing=True)
+            await ctx.send(("✅" if okay else "⚠️") + f" Category **{name}** saved. {message}")
             return
-        lines = [f"**Role channel:** {channel.mention} (`{channel.id}`)"]
-        perms = channel.permissions_for(channel.guild.me)
-        needed = ("view_channel", "send_messages", "embed_links", "add_reactions", "read_message_history")
-        missing = [name for name in needed if not getattr(perms, name)]
-        lines.append("**Bot permissions in that channel:** " + ("all OK" if not missing else "MISSING " + ", ".join(missing)))
-        if not perms.manage_messages:
-            lines.append("Optional: give me **Manage Messages** so removing a role clears reactions.")
-        lines.append("**Saved panels:**")
-        labels = {
-            "none": "no panel yet (run `.setup_roles`)",
-            "missing": "the message was deleted (run `.setup_roles`)",
-            "foreign": "an old message (run `.setup_roles` to re-post)",
-            "ok": "OK, active and editable",
-        }
-        for row in _all_categories():
+        if action == "rename":
+            parts = [p.strip() for p in details.split("|", 1)]
+            if len(parts) != 2 or not all(parts):
+                await ctx.send("Usage: `.rolecategory rename <old name> | <new name>`")
+                return
+            old, new = parts
+            category = _get_category(old)
+            if not category:
+                await ctx.send(f"❌ I couldn't find category **{old}**.")
+                return
+            if _get_category(new):
+                await ctx.send(f"❌ Category **{new}** already exists.")
+                return
+            with _connect() as con:
+                con.execute("UPDATE categories SET name=?, title=? WHERE id=?", (new, new.upper(), category["id"]))
+            updated = _get_category(new)
+            okay, message = await _sync_panel(bot, updated)
+            await ctx.send(("✅" if okay else "⚠️") + f" Category renamed to **{new}**. {message}")
+            return
+        if action == "remove":
+            name = details.strip()
+            category = _get_category(name)
+            if not category:
+                await ctx.send(f"❌ I couldn't find category **{name}**.")
+                return
+            with _connect() as con:
+                con.execute("DELETE FROM categories WHERE id=?", (category["id"],))
+            # Intentionally leave the old message in place rather than deleting user-visible history.
+            await ctx.send(f"✅ Category **{name}** and its role mappings were removed from configuration. Its old panel message was left in the channel; delete it manually if you no longer want it visible. Server roles were not deleted.")
+            return
+        await ctx.send("❌ Unknown action. Use `add`, `rename`, or `remove`.")
+
+    @bot.command(name="roleadd")
+    @commands.guild_only()
+    @admin_only()
+    async def roleadd(ctx: commands.Context, *, details: str):
+        parts = [p.strip() for p in details.split("|", 2)]
+        if len(parts) != 3 or not all(parts):
+            await ctx.send("Usage: `.roleadd <category> | <emoji> | <role name>`\nExample: `.roleadd Music | 🎧 | Listener`\nI'll create the server role automatically if it doesn't exist.")
+            return
+        category_name, emoji, role_name = parts
+        category = _get_category(category_name)
+        if not category:
+            await ctx.send(f"❌ I couldn't find category **{category_name}**. Create it with `.rolecategory add {category_name}` first.")
+            return
+        if not _valid_emoji(emoji):
+            await ctx.send("❌ That emoji is empty or too long.")
+            return
+        mappings = _get_mappings(category["id"])
+        if any(m["emoji"] == emoji for m in mappings):
+            await ctx.send(f"❌ Emoji {emoji} is already used in **{category_name}**. Remove or edit that mapping first.")
+            return
+        if any(m["role_name"].casefold() == role_name.casefold() for m in mappings):
+            await ctx.send(f"❌ Role **{role_name}** is already mapped in **{category_name}**.")
+            return
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("❌ This command only works inside a server.")
+            return
+        role = discord.utils.get(guild.roles, name=role_name)
+        created = False
+        if role is None:
+            me = guild.me
+            if not (me.guild_permissions.manage_roles or me.guild_permissions.administrator):
+                await ctx.send("❌ I can't create roles because I lack **Manage Roles** permission.")
+                return
             try:
-                state, message = await _panel_state(bot, row["key"])
-                text = labels[state] + (f" - {message.jump_url}" if message else "")
+                role = await guild.create_role(name=role_name, reason=f"Reaction role added by {ctx.author}")
+                created = True
+            except discord.Forbidden:
+                await ctx.send("❌ Discord denied role creation. Check my Manage Roles permission and role hierarchy.")
+                return
+            except discord.HTTPException as exc:
+                await ctx.send(f"❌ Discord couldn't create the role: {exc}")
+                return
+        with _connect() as con:
+            try:
+                con.execute("INSERT INTO role_mappings(category_id,emoji,role_name) VALUES(?,?,?)", (category["id"], emoji, role.name))
+            except sqlite3.IntegrityError:
+                await ctx.send("❌ This emoji or role is already mapped in that category.")
+                if created:
+                    try:
+                        await role.delete(reason="Undo failed reaction-role mapping")
+                    except discord.HTTPException:
+                        pass
+                return
+        okay, message = await _sync_panel(bot, _get_category(category_name))
+        if not okay:
+            with _connect() as con:
+                con.execute("DELETE FROM role_mappings WHERE category_id=? AND emoji=?", (category["id"], emoji))
+            if created:
+                try:
+                    await role.delete(reason="Undo failed reaction-role panel update")
+                except discord.HTTPException:
+                    pass
+            await ctx.send(f"❌ I couldn't finish adding {emoji} → **{role.name}**. Mapping rolled back. {message}")
+            return
+        prefix = "Created the role and " if created else "Reused the existing role and "
+        await ctx.send(f"✅ {prefix}added {emoji} → **{role.name}** to **{category_name}**. {message}")
+
+    @bot.command(name="roleremove")
+    @commands.guild_only()
+    @admin_only()
+    async def roleremove(ctx: commands.Context, *, details: str):
+        parts = [p.strip() for p in details.split("|", 1)]
+        if len(parts) != 2 or not all(parts):
+            await ctx.send("Usage: `.roleremove <category> | <emoji>`\nThis removes the mapping, not the actual server role.")
+            return
+        category_name, emoji = parts
+        category = _get_category(category_name)
+        if not category:
+            await ctx.send(f"❌ I couldn't find category **{category_name}**.")
+            return
+        with _connect() as con:
+            cur = con.execute("DELETE FROM role_mappings WHERE category_id=? AND emoji=?", (category["id"], emoji))
+            removed = cur.rowcount
+        if not removed:
+            await ctx.send(f"❌ Emoji {emoji} isn't mapped in **{category_name}**.")
+            return
+        okay, message = await _sync_panel(bot, _get_category(category_name))
+        if not okay:
+            await ctx.send(f"⚠️ Removed the mapping from storage, but couldn't update the panel. Run `.rolepanel update {category_name}` to retry. {message}")
+            return
+        await ctx.send(f"✅ Removed mapping {emoji} from **{category_name}**. The server role itself was kept. {message}")
+
+    @bot.command(name="roleedit")
+    @commands.guild_only()
+    @admin_only()
+    async def roleedit(ctx: commands.Context, *, details: str):
+        parts = [p.strip() for p in details.split("|", 3)]
+        if len(parts) != 4 or not all(parts):
+            await ctx.send("Usage: `.roleedit <category> | <old emoji> | <new emoji> | <role name>`")
+            return
+        cat_name, old_emoji, new_emoji, role_name = parts
+        category = _get_category(cat_name)
+        if not category:
+            await ctx.send(f"❌ I couldn't find category **{cat_name}**.")
+            return
+        mappings = _get_mappings(category["id"])
+        old = next((m for m in mappings if m["emoji"] == old_emoji), None)
+        if not old:
+            await ctx.send(f"❌ Emoji {old_emoji} isn't mapped in **{cat_name}**.")
+            return
+        if any(m["emoji"] == new_emoji and m["emoji"] != old_emoji for m in mappings):
+            await ctx.send(f"❌ Emoji {new_emoji} is already in use in **{cat_name}**.")
+            return
+        if any(m["role_name"].casefold() == role_name.casefold() and m["id"] != old["id"] for m in mappings):
+            await ctx.send(f"❌ Role **{role_name}** is already mapped in **{cat_name}**.")
+            return
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("❌ This command only works inside a server.")
+            return
+        role = discord.utils.get(guild.roles, name=role_name)
+        created = False
+        if role is None:
+            try:
+                role = await guild.create_role(name=role_name, reason=f"Reaction role edited by {ctx.author}")
+                created = True
             except (discord.Forbidden, discord.HTTPException) as exc:
-                text = f"couldn't check ({exc})"
-            lines.append(f"• `{row['key']}`: {text}")
-        await ctx.send("\n".join(lines)[:1900])
-
-    @bot.command(name="setup_roles", aliases=["migrate_role_panels"], help="Post or refresh role panels with buttons & reactions.")
-    @commands.guild_only()
-    @commands.has_guild_permissions(manage_roles=True)
-    async def setup_roles(ctx: commands.Context):
-        await ctx.send("Checking role panels. I'll refresh working ones with buttons, link existing ones, and post any that are missing…")
-        await ctx.send((await _setup_panels(bot))[:1900])
-
-    @bot.command(name="rolecategories", help="List configured role categories and their panel status.")
-    @commands.guild_only()
-    async def rolecategories(ctx: commands.Context):
-        lines = []
-        for row in _all_categories():
-            panel = _panel(row["key"])
-            lines.append(f"**{row['title']}** — `{row['key']}` — {len(_roles(row['key']))} roles — {'has panel' if panel else 'no panel yet'}")
-        await ctx.send("\n".join(lines)[:1900] or "No categories configured.")
-
-    @bot.command(name="categoryadd", help="Add a category: .categoryadd <id> <#color> <title>")
-    @commands.guild_only()
-    @commands.has_guild_permissions(manage_roles=True)
-    async def categoryadd(ctx: commands.Context, key: str, color_hex: str, *, title: str):
-        async with ctx.typing():
-            result = await _add_category(bot, key, title, color_hex)
-        await ctx.send(result)
-
-    @bot.command(name="roleadd", help="Add a role to a category: .roleadd <category> <emoji> <exact role name or @Role>")
-    @commands.guild_only()
-    @commands.has_guild_permissions(manage_roles=True)
-    async def roleadd(ctx: commands.Context, category_key: str, emoji: str, *, role_name: str):
-        if ctx.guild is None:
+                await ctx.send(f"❌ Couldn't create role **{role_name}**: {exc}")
+                return
+        with _connect() as con:
+            con.execute("UPDATE role_mappings SET emoji=?, role_name=? WHERE id=?", (new_emoji, role.name, old["id"]))
+        okay, message = await _sync_panel(bot, _get_category(cat_name))
+        if not okay:
+            await ctx.send(f"⚠️ Saved the mapping but couldn't update the panel. Run `.rolepanel update {cat_name}`. {message}")
             return
-        async with ctx.typing():
-            result = await _add_role(bot, ctx.guild, category_key, emoji, role_name)
-        await ctx.send(result)
+        await ctx.send(f"✅ Updated {old_emoji} → {new_emoji} and set the mapped role to **{role.name}** in **{cat_name}**. {'Created the role. ' if created else ''}{message}")
 
-    @bot.command(name="roleremove", help="Remove a role from a category: .roleremove <category> <emoji or role name>")
+    @bot.command(name="rolecreate")
     @commands.guild_only()
-    @commands.has_guild_permissions(manage_roles=True)
-    async def roleremove(ctx: commands.Context, category_key: str, *, emoji_or_role: str):
-        async with ctx.typing():
-            result = await _remove_role(bot, category_key, emoji_or_role)
-        await ctx.send(result)
-
-    for command in (roles_dashboard, rolecheck, setup_roles, rolecategories, categoryadd, roleadd, roleremove):
-        command.error(_role_command_error)
-
-    # --- Reaction Listeners ---
-
-    async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-        result = await _resolve_reaction(bot, payload)
-        if result is None:
+    @admin_only()
+    async def rolecreate(ctx: commands.Context, *, name: str):
+        name = name.strip()
+        if not name:
+            await ctx.send("Usage: `.rolecreate <role name>`")
             return
-        member, role = result
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("❌ This command only works inside a server.")
+            return
+        if discord.utils.get(guild.roles, name=name):
+            await ctx.send(f"❌ Role **{name}** already exists.")
+            return
         try:
-            await member.add_roles(role, reason="Reaction role panel")
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("Couldn't give %s to %s: %s", role.name, member, exc)
+            role = await guild.create_role(name=name, reason=f"Role created by {ctx.author}")
+        except discord.Forbidden:
+            await ctx.send("❌ I can't create roles. Give me Manage Roles and move my bot role above the roles I need to manage.")
+        except discord.HTTPException as exc:
+            await ctx.send(f"❌ Discord couldn't create the role: {exc}")
+        else:
+            await ctx.send(f"✅ Created server role **{role.name}**.")
 
-    async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-        result = await _resolve_reaction(bot, payload)
-        if result is None:
+    @bot.command(name="roledelete")
+    @commands.guild_only()
+    @admin_only()
+    async def roledelete(ctx: commands.Context, *, name: str):
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("❌ This command only works inside a server.")
             return
-        member, role = result
+        role = discord.utils.get(guild.roles, name=name.strip())
+        if role is None:
+            await ctx.send(f"❌ I couldn't find server role **{name}**.")
+            return
+        if role == guild.default_role or role.managed:
+            await ctx.send("❌ That role is managed by Discord or is @everyone and cannot be deleted by this command.")
+            return
+        bot_member = guild.me
+        if bot_member is None and bot.user is not None:
+            bot_member = guild.get_member(bot.user.id)
+        if bot_member is None:
+            await ctx.send("❌ I couldn't identify my bot member in this server. Try again after reconnecting.")
+            return
+        if role >= bot_member.top_role:
+            await ctx.send("❌ I can't delete that role because it is at or above my highest role. Move my bot role higher.")
+            return
         try:
-            await member.remove_roles(role, reason="Reaction role removed")
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("Couldn't remove %s from %s: %s", role.name, member, exc)
+            await role.delete(reason=f"Role deleted by {ctx.author}")
+        except discord.Forbidden:
+            await ctx.send("❌ Discord denied role deletion. Check Manage Roles and role hierarchy.")
+        except discord.HTTPException as exc:
+            await ctx.send(f"❌ Discord couldn't delete that role: {exc}")
+        else:
+            # Remove any mappings to that role from all categories, then refresh their panels.
+            with _connect() as con:
+                con.execute("DELETE FROM role_mappings WHERE role_name=? COLLATE NOCASE", (name.strip(),))
+            for category in _get_categories():
+                await _sync_panel(bot, category)
+            await ctx.send(f"✅ Deleted role **{name}** and removed its configured reaction-role mappings.")
 
-    bot.add_listener(on_raw_reaction_add, "on_raw_reaction_add")
-    bot.add_listener(on_raw_reaction_remove, "on_raw_reaction_remove")
+    @bot.command(name="rolepanel")
+    @commands.guild_only()
+    @admin_only()
+    async def rolepanel(ctx: commands.Context, action: str, *, details: str):
+        action = action.lower().strip()
+        if action == "update":
+            category = _get_category(details.strip())
+            if not category:
+                await ctx.send(f"❌ I couldn't find category **{details.strip()}**.")
+                return
+            okay, message = await _sync_panel(bot, category, create_if_missing=True)
+            await ctx.send(("✅ " if okay else "❌ ") + message)
+            return
+        if action not in {"title", "description", "color"}:
+            await ctx.send("Usage: `.rolepanel update <category>` or `.rolepanel title|description|color <category> | <value>`")
+            return
+        parts = [p.strip() for p in details.split("|", 1)]
+        if len(parts) != 2 or not all(parts):
+            await ctx.send(f"Usage: `.rolepanel {action} <category> | <value>`")
+            return
+        cat_name, value = parts
+        category = _get_category(cat_name)
+        if not category:
+            await ctx.send(f"❌ I couldn't find category **{cat_name}**.")
+            return
+        with _connect() as con:
+            if action == "title":
+                if len(value) > 256:
+                    await ctx.send("❌ Embed titles must be 256 characters or fewer.")
+                    return
+                con.execute("UPDATE categories SET title=? WHERE id=?", (value, category["id"]))
+            elif action == "description":
+                if len(value) > 1500:
+                    await ctx.send("❌ Panel descriptions must be 1,500 characters or fewer.")
+                    return
+                con.execute("UPDATE categories SET description=? WHERE id=?", (value, category["id"]))
+            else:
+                color = value.lstrip("#")
+                if not re.fullmatch(r"[0-9a-fA-F]{6}", color):
+                    await ctx.send("❌ Invalid color. Use a six-digit hex color, such as `#C5B3D3`.")
+                    return
+                con.execute("UPDATE categories SET color=? WHERE id=?", (int(color, 16), category["id"]))
+        okay, message = await _sync_panel(bot, _get_category(cat_name))
+        await ctx.send(("✅ " if okay else "⚠️ ") + f"Saved {action} for **{cat_name}**. {message}")
 
-    print("Role manager loaded: .roles, .rolecheck, .setup_roles, .rolecategories, .categoryadd, .roleadd, .roleremove + /role-category")
+    # Raw reaction events work even when the panel message isn't cached.
+    @bot.listen("on_raw_reaction_add")
+    async def role_reaction_add(payload: discord.RawReactionActionEvent):
+        if payload.guild_id is None or bot.user is None or payload.user_id == bot.user.id:
+            return
+        category = next((c for c in _get_categories() if c.get("panel_message_id") == payload.message_id and c.get("panel_channel_id") == payload.channel_id), None)
+        if category is None:
+            return
+        emoji = str(payload.emoji)
+        mapping = next((m for m in _get_mappings(category["id"]) if m["emoji"] == emoji), None)
+        if mapping is None:
+            return
+        guild = bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        role = discord.utils.get(guild.roles, name=mapping["role_name"])
+        if role is None:
+            log.warning("Role '%s' configured in category '%s' no longer exists", mapping["role_name"], category["name"])
+            return
+        try:
+            member = payload.member or await guild.fetch_member(payload.user_id)
+            bot_member = guild.me
+            if bot_member is None and bot.user is not None:
+                bot_member = guild.get_member(bot.user.id)
+            if bot_member is None or role >= bot_member.top_role:
+                log.warning("Cannot assign role '%s': bot member is missing or role is at/above its highest role", role.name)
+                return
+            await member.add_roles(role, reason=f"Reaction role: {category['name']} / {emoji}")
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("Could not assign reaction role: %s", exc)
+
+    @bot.listen("on_raw_reaction_remove")
+    async def role_reaction_remove(payload: discord.RawReactionActionEvent):
+        if payload.guild_id is None or bot.user is None or payload.user_id == bot.user.id:
+            return
+        category = next((c for c in _get_categories() if c.get("panel_message_id") == payload.message_id and c.get("panel_channel_id") == payload.channel_id), None)
+        if category is None:
+            return
+        mapping = next((m for m in _get_mappings(category["id"]) if m["emoji"] == str(payload.emoji)), None)
+        if mapping is None:
+            return
+        guild = bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        role = discord.utils.get(guild.roles, name=mapping["role_name"])
+        if role is None:
+            return
+        try:
+            member = await guild.fetch_member(payload.user_id)
+            await member.remove_roles(role, reason=f"Reaction role removed: {category['name']} / {payload.emoji}")
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("Could not remove reaction role: %s", exc)
+
+    log.info("Database-driven reaction-role system registered (normal bot messages, no webhooks).")
