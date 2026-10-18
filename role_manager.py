@@ -11,8 +11,10 @@ import re
 import sqlite3
 from pathlib import Path
 from typing import Optional
+from unicodedata import category
 
 import discord
+from discord import guild
 from discord.ext import commands
 
 ROLE_CHANNEL_ID = 1550216770156232834
@@ -286,6 +288,7 @@ async def _sync_panel(
 
     return True, "Panel updated successfully."
 
+
 def _admin_check():
     return commands.has_guild_permissions(manage_roles=True)
 
@@ -444,7 +447,6 @@ def install_role_manager(bot: commands.Bot):
         await ctx.send(f"✅ {prefix}added {emoji} → **{role.name}** to **{category_name}**. {message}")
 
     
-    
     @bot.command(name="roleremove")
     @commands.guild_only()
     @admin_only()
@@ -456,9 +458,7 @@ def install_role_manager(bot: commands.Bot):
 
         parts = [p.strip() for p in details.split("|", 1)]
         if len(parts) != 2 or not all(parts):
-            await ctx.send(
-                "Usage: `.roleremove <category> | <emoji>`"
-            )
+            await ctx.send("Usage: `.roleremove <category> | <emoji>`")
             return
 
         category_name, emoji = parts
@@ -466,9 +466,11 @@ def install_role_manager(bot: commands.Bot):
 
         if not category:
             await ctx.send(
-                f"❌ I couldn't find category **{category_name}**."
-            )
+            f"❌ I couldn't find category **{category_name}**.")
             return
+
+        role_name = None
+        other_mapping = False
 
         with _connect() as con:
             row = con.execute(
@@ -479,39 +481,45 @@ def install_role_manager(bot: commands.Bot):
                 (category["id"], emoji),
             ).fetchone()
 
-            if not row:
-                await ctx.send(
-                    f"❌ Emoji {emoji} isn't mapped in **{category_name}**."
+            if row:
+                role_name = row[0]
+
+                other_mapping = con.execute(
+                    """
+                    SELECT 1 FROM role_mappings
+                    WHERE role_name = ?
+                    AND NOT (category_id = ? AND emoji = ?)
+                    LIMIT 1
+                   """,
+                    (role_name, category["id"], emoji),
+                ).fetchone() is not None
+
+                con.execute(
+                    """
+                    DELETE FROM role_mappings
+                    WHERE category_id = ? AND emoji = ?
+                    """,
+                    (category["id"], emoji),
                 )
-                return
 
-            role_name = row[0]
-
-            other_mapping = con.execute(
-                """
-                SELECT 1 FROM role_mappings
-                WHERE role_name = ?
-                  AND NOT (category_id = ? AND emoji = ?)
-                LIMIT 1
-                """,
-                (role_name, category["id"], emoji),
-            ).fetchone()
-
-            con.execute(
-                """
-                DELETE FROM role_mappings
-                WHERE category_id = ? AND emoji = ?
-                """,
-                (category["id"], emoji),
-            )
-
-        okay, message = await _sync_panel(
+    # Always synchronize the panel, even if the mapping was
+    # already deleted during an earlier attempt.
+        okay, sync_message = await _sync_panel(
             bot, _get_category(category_name)
         )
 
         if not okay:
             await ctx.send(
-                f"⚠️ Mapping removed, but panel update failed: {message}"
+                f"⚠️ Couldn't synchronize **{category_name}**: "
+                f"{sync_message}"
+            )
+            return
+
+        # Mapping was already absent; this attempt was just cleanup.
+        if role_name is None:
+            await ctx.send(
+                f"✅ Checked **{category_name}** and synchronized its panel. "
+                f"{sync_message}"
             )
             return
 
@@ -519,7 +527,7 @@ def install_role_manager(bot: commands.Bot):
             await ctx.send(
                 f"✅ Removed {emoji} from **{category_name}**. "
                 f"Role **{role_name}** was kept because another category "
-                f"uses it. {message}"
+                f"uses it. {sync_message}"
             )
             return
 
@@ -528,22 +536,22 @@ def install_role_manager(bot: commands.Bot):
         if role is None:
             await ctx.send(
                 f"✅ Mapping removed. Role **{role_name}** was already "
-                f"missing. {message}"
+                f"missing. {sync_message}"
             )
             return
 
         me = guild.me
         if me is None:
             await ctx.send(
-                "⚠️ Mapping removed, but I couldn't verify the bot's "
-                "role hierarchy. Delete the role manually if needed."
+                "⚠️ Mapping and panel updated, but I couldn't verify the "
+                "bot's role hierarchy. Delete the role manually if needed."
             )
             return
 
         if role.managed or role >= me.top_role:
             await ctx.send(
-                f"⚠️ Mapping removed, but I couldn't delete **{role_name}**. "
-                f"Check role hierarchy and delete it manually if needed."
+                f"⚠️ Mapping and panel updated, but I couldn't delete "
+                f"**{role_name}**. Check the bot's role hierarchy."
             )
             return
 
@@ -553,13 +561,13 @@ def install_role_manager(bot: commands.Bot):
             )
             await ctx.send(
                 f"✅ Removed {emoji} from **{category_name}**.\n"
-                f"🗑️ Deleted server role **{role_name}**.\n"
-                f"✅ Panel updated successfully."
+               f"🗑️ Deleted server role **{role_name}**.\n"
+               f"✅ Panel synchronized successfully."
             )
         except discord.Forbidden:
             await ctx.send(
-                f"⚠️ Panel updated, but Discord denied permission to "
-                f"delete **{role_name}**. Check Manage Roles and hierarchy."
+                f"⚠️ Panel updated, but Discord denied permission to delete "
+                f"**{role_name}**. Check Manage Roles and role hierarchy."
             )
         except discord.HTTPException as error:
             await ctx.send(
