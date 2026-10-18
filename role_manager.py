@@ -246,27 +246,52 @@ async def _sync_panel(
 
     # Remove reactions that no longer have a role mapping.
     try:
-        for reaction in list(message.reactions):
-            emoji = str(reaction.emoji)
+        message = await channel.fetch_message(message.id)
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+        log.error("Couldn't refresh role panel before reaction cleanup: %s", exc)
+        return False, f"Couldn't refresh the role panel: {exc}"
 
-            if emoji not in valid_emojis:
-                try:
-                    await message.clear_reaction(reaction.emoji)
-                    log.info(
-                        "Removed obsolete reaction %s from panel %s.",
-                        emoji,
-                        category["name"],
-                    )
-                except (discord.Forbidden, discord.HTTPException) as exc:
-                    log.warning(
-                        "Couldn't remove obsolete reaction %s: %s",
-                        emoji,
-                        exc,
-                    )
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        log.warning("Couldn't inspect panel reactions: %s", exc)
+    mappings = _get_mappings(category["id"])
+    valid_emojis = {item["emoji"] for item in mappings}
+    cleanup_failed = []
 
-    # Add reactions for all current mappings.
+    # Remove reactions whose emoji no longer has a role mapping.
+    for reaction in list(message.reactions):
+        emoji = str(reaction.emoji)
+
+        if emoji in valid_emojis:
+            continue
+
+        try:
+            await message.clear_reaction(reaction.emoji)
+            log.info(
+                "Cleared obsolete reaction %s from category %s.",
+                emoji,
+                category["name"],
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            cleanup_failed.append(emoji)
+            log.error(
+                "Failed to clear obsolete reaction %s from category %s: %s",
+                emoji,
+                category["name"],
+                exc,
+            )
+
+    if cleanup_failed:
+        return True, (
+            "Panel updated, but Discord couldn't remove these obsolete "
+            "reactions: " + ", ".join(cleanup_failed)
+            + ". Check the bot's channel permissions and logs."
+        )
+
+    # Add reactions for mappings that are still valid.
+    try:
+        message = await channel.fetch_message(message.id)
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+        log.error("Couldn't refresh role panel before adding reactions: %s", exc)
+        return True, f"Panel updated and cleanup attempted, but couldn't refresh reactions: {exc}"
+
     existing_emojis = {str(reaction.emoji) for reaction in message.reactions}
 
     for item in mappings:
@@ -287,7 +312,6 @@ async def _sync_panel(
             )
 
     return True, "Panel updated successfully."
-
 
 def _admin_check():
     return commands.has_guild_permissions(manage_roles=True)
