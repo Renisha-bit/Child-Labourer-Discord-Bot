@@ -18,7 +18,7 @@ from discord import guild
 from discord.ext import commands
 
 ROLE_CHANNEL_ID = 1550216770156232834
-PANEL_COLOR = 0xC5B3D3
+PANEL_COLOR = 0xd82734
 DB_PATH = Path(__file__).resolve().parent / "role_manager.sqlite3"
 log = logging.getLogger("discord.role_manager")
 
