@@ -237,17 +237,54 @@ async def _sync_panel(
     else:
         return False, "The saved panel message is missing. Run `.rolesetup` to create a replacement."
 
-    for item in _get_mappings(category["id"]):
+    
+    # Get the current valid emoji mappings for this category.
+    mappings = _get_mappings(category["id"])
+    valid_emojis = {item["emoji"] for item in mappings}
+
+    # Remove reactions that no longer have a role mapping.
+    try:
+        for reaction in list(message.reactions):
+            emoji = str(reaction.emoji)
+
+            if emoji not in valid_emojis:
+                try:
+                    await message.clear_reaction(reaction.emoji)
+                    log.info(
+                        "Removed obsolete reaction %s from panel %s.",
+                        emoji,
+                        category["name"],
+                    )
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    log.warning(
+                        "Couldn't remove obsolete reaction %s: %s",
+                        emoji,
+                        exc,
+                    )
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.warning("Couldn't inspect panel reactions: %s", exc)
+
+    # Add reactions for all current mappings.
+    existing_emojis = {str(reaction.emoji) for reaction in message.reactions}
+
+    for item in mappings:
+        if item["emoji"] in existing_emojis:
+            continue
+
         try:
             await message.add_reaction(item["emoji"])
         except (discord.Forbidden, discord.HTTPException) as exc:
-            log.warning("Panel updated but couldn't add reaction %s: %s", item["emoji"], exc)
+            log.warning(
+                "Panel updated but couldn't add reaction %s: %s",
+                item["emoji"],
+                exc,
+            )
             return True, (
                 f"Panel updated, but I couldn't add reaction {item['emoji']}. "
                 "Check that emoji and Add Reactions permission."
             )
-    return True, "Panel updated successfully."
 
+    return True, "Panel updated successfully."
 
 def _admin_check():
     return commands.has_guild_permissions(manage_roles=True)
