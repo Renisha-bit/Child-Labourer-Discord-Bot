@@ -457,6 +457,163 @@ async def check_youtube_upload():
 
         await asyncio.sleep(300)
 
+# ========================= YOUTUBE MANUAL TEST COMMAND =========================
+
+@bot.command(name="youtubetest")
+@commands.has_permissions(administrator=True)
+async def youtubetest(ctx: commands.Context):
+    """Manually test the YouTube upload notification system."""
+
+    await ctx.send("🧪 Checking the YouTube feed and preparing a test notification...")
+
+    url = (
+        "https://www.youtube.com/feeds/videos.xml"
+        f"?channel_id={YOUTUBE_CHANNEL_ID}"
+    )
+
+    namespace = {
+        "yt": "http://www.youtube.com/xml/schemas/2015",
+        "atom": "http://www.w3.org/2005/Atom",
+    }
+
+    try:
+        # Fetch the RSS feed without changing the automatic checker's state.
+        timeout = aiohttp.ClientTimeout(total=30)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    await ctx.send(
+                        f"❌ YouTube RSS returned HTTP {response.status}."
+                    )
+                    return
+
+                data = await response.text()
+
+        root = ET.fromstring(data)
+        entries = root.findall("atom:entry", namespace)
+
+        # The feed is newest-first. Select the second entry so the
+        # test uses an older upload instead of the latest one.
+        if len(entries) < 2:
+            await ctx.send(
+                "❌ The YouTube feed doesn't contain enough videos "
+                "to select an older upload. Try again later."
+            )
+            return
+
+        entry = entries[1]
+
+        video_id_element = entry.find("yt:videoId", namespace)
+        title_element = entry.find("atom:title", namespace)
+        author_element = entry.find("atom:author/atom:name", namespace)
+        author_url_element = entry.find("atom:author/atom:uri", namespace)
+
+        if (
+            video_id_element is None
+            or not video_id_element.text
+            or title_element is None
+        ):
+            await ctx.send("❌ Couldn't read the older video's details.")
+            return
+
+        video_id = video_id_element.text
+        title = title_element.text or "YouTube video"
+        channel_name = (
+            author_element.text
+            if author_element is not None and author_element.text
+            else "YouTube"
+        )
+        channel_url = (
+            author_url_element.text
+            if author_url_element is not None and author_url_element.text
+            else f"https://www.youtube.com/channel/{YOUTUBE_CHANNEL_ID}"
+        )
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+
+        # Resolve the configured notification channel.
+        notification_channel = bot.get_channel(
+            UPLOAD_NOTIFICATION_CHANNEL_ID
+        )
+
+        if notification_channel is None:
+            try:
+                notification_channel = await bot.fetch_channel(
+                    UPLOAD_NOTIFICATION_CHANNEL_ID
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                await ctx.send(
+                    f"❌ Couldn't access the upload notification channel: {error}"
+                )
+                return
+
+        if not isinstance(notification_channel, discord.TextChannel):
+            await ctx.send(
+                "❌ The configured upload notification destination "
+                "isn't a regular text channel."
+            )
+            return
+
+        # Use the same Upload Ping role as the automatic notifier.
+        role = discord.utils.get(
+            notification_channel.guild.roles,
+            name=UPLOAD_ROLE_NAME,
+        )
+        role_mention = role.mention if role is not None else ""
+
+        embed = discord.Embed(
+            title=title,
+            url=video_url,
+            description=(
+                "🧪 **Manual YouTube notification test**\n\n"
+                f"[**Watch {discord.utils.escape_markdown(title)}**]"
+                f"({video_url})"
+            ),
+            color=discord.Color.from_str("#C5B3D3"),
+        )
+
+        embed.set_author(name=channel_name, url=channel_url)
+        embed.set_image(
+            url=f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+        )
+        embed.set_footer(text="YouTube • Manual Test")
+
+        message_content = (
+            f"{role_mention}\n\n"
+            f"## YouTube notification test from "
+            f"[{channel_name}]({channel_url})\n\n"
+            f"> This is a manual test. No new upload was detected or "
+            f"announced by the automatic checker.\n"
+            f"> Manage notifications in <#{ROLE_CHANNEL_ID}>."
+        )
+
+        await notification_channel.send(
+            content=message_content,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
+
+        await ctx.send(
+            f"✅ Test notification sent to "
+            f"{notification_channel.mention}!\n"
+            f"📹 Video: **{title}**\n"
+            f"🆔 Video ID: `{video_id}`\n"
+            "The automatic notifier's saved state was not changed."
+        )
+
+    except (aiohttp.ClientError, ET.ParseError) as error:
+        await ctx.send(f"❌ YouTube feed error: `{error}`")
+    except discord.Forbidden:
+        await ctx.send(
+            "❌ Discord denied permission to send the test notification. "
+            "Check the bot's channel permissions."
+        )
+    except discord.HTTPException as error:
+        await ctx.send(f"❌ Discord couldn't send the test notification: {error}")
+    except Exception as error:
+        logging.exception("YouTube manual test failed")
+        await ctx.send(f"❌ The YouTube test failed: `{error}`")
+
 # ========================= START BOT =========================
 
 install_role_manager(bot)

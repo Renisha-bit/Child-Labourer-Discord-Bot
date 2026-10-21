@@ -1,10 +1,8 @@
 high to low priority todo list
 
-~~update the roles section and database~~
 make the message deletion of containing vulger words smoother 
-add logs for edits and message delteion that is not bypass-able 
-some are still able to bypass the message delteion so figure that out
-Youtube push notification
+add logs for edits and message delteion that is not bypass-able | some are still able to bypass the message delteion so figure that out
+Youtube push notification test | add a test command that it will 
 Add a remainder thing that child laborer send a message to restart the platform every 4 days amd tell 
 Some interactive commands
 how much time is left by checking the platform 
