@@ -401,7 +401,7 @@ async def check_youtube_upload():
                                 f"[**Watch {discord.utils.escape_markdown(title)}**]"
                                 f"({video_url})"
                             ),
-                            color=discord.Color.from_str("#C5B3D3")
+                            color=discord.Color.from_str("#C033DD")
                         )
 
                         embed.set_author(
@@ -569,7 +569,7 @@ async def youtubetest(ctx: commands.Context):
                 f"[**Watch {discord.utils.escape_markdown(title)}**]"
                 f"({video_url})"
             ),
-            color=discord.Color.from_str("#C5B3D3"),
+            color=discord.Color.from_str("#C033DD"),
         )
 
         embed.set_author(name=channel_name, url=channel_url)

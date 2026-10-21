@@ -18,7 +18,7 @@ from discord import guild
 from discord.ext import commands
 
 ROLE_CHANNEL_ID = 1550216770156232834
-PANEL_COLOR = 0xd82734
+PANEL_COLOR = 0xc033dd # A purple color for the role panels.
 DB_PATH = Path(__file__).resolve().parent / "role_manager.sqlite3"
 log = logging.getLogger("discord.role_manager")
 
