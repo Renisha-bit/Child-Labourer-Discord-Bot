@@ -13,6 +13,10 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import json
+
 # Reaction roles live entirely in role_manager.py (database-driven). main.py must not
 # define its own reaction handlers or panel commands, or the two would clash.
 from role_manager import ROLE_CHANNEL_ID, install_role_manager
@@ -77,6 +81,10 @@ def report_setup():
     else:
         print(f"[setup] Role channel #{channel.name}: permissions OK")
 
+# 
+youtube_task: asyncio.Task | None = None
+deployment_reminder_task: asyncio.Task | None = None
+# 
 
 @bot.event
 async def on_ready():
@@ -84,11 +92,20 @@ async def on_ready():
     print("Commands loaded: " + ", ".join(sorted(command.name for command in bot.commands)))
     report_setup()
 
-    # on_ready can fire again after a reconnect, so only (re)start the task if needed.
-    global youtube_task
+    global youtube_task, deployment_reminder_task
+
+    # Start or restart the YouTube checker if needed.
     if youtube_task is None or youtube_task.done():
         youtube_task = asyncio.create_task(check_youtube_upload())
 
+    # Start or restart the deployment reminder if needed.
+    if (
+        deployment_reminder_task is None
+        or deployment_reminder_task.done()
+    ):
+        deployment_reminder_task = asyncio.create_task(
+            check_deployment_renewal()
+        )
 
 @bot.event
 async def on_member_join(member):
@@ -168,7 +185,7 @@ async def on_command_error(ctx, error):
 async def ping(ctx):
     await ctx.send("Pong!")
 
-# ANNOUNCE COMMAND
+# ========================= ANNOUNCE COMMAND =========================
 
 @bot.command()
 @commands.guild_only()
@@ -214,6 +231,25 @@ async def announce(ctx):
     except asyncio.TimeoutError:
         await ctx.send("Timed out. Please run `.announce` again.")
 
+# ================= DEPLOYMENT RENEWAL REMINDER =================
+
+DEPLOYMENT_RENEWAL_CHANNEL_ID = 1451963373939069090  # Replace with your channel ID
+DEPLOYMENT_MODERATOR_ROLE_ID = 1451948239262842962   # Replace with your moderator role ID
+
+DEPLOYMENT_URL = (
+    "https://bot-hosting.net/a/d/"
+    "47764bd5-6054-4862-89e2-f040d905045c"
+)
+
+DEPLOYMENT_TIMEZONE = ZoneInfo("Asia/Kolkata")
+
+# Date and time when the deployment expires
+DEPLOYMENT_EXPIRY = datetime(
+    2026, 10, 22, 9, 0,
+    tzinfo=DEPLOYMENT_TIMEZONE
+)
+
+DEPLOYMENT_REMINDER_STATE_FILE = BASE_DIR / "deployment_reminder_state.json"
 # ========================= YOUTUBE UPLOAD NOTIFICATIONS =========================
 
 UPLOAD_NOTIFICATION_CHANNEL_ID = 1444934366043177033
@@ -614,6 +650,150 @@ async def youtubetest(ctx: commands.Context):
         logging.exception("YouTube manual test failed")
         await ctx.send(f"❌ The YouTube test failed: `{error}`")
 
+# ========================= RENEWAL TIME LEFT CHECK COMMAND =========================
+
+@bot.command(name="renewalstatus")
+@commands.has_permissions(administrator=True)
+async def renewalstatus(ctx: commands.Context):
+    """Show the remaining time until deployment renewal."""
+
+    now = datetime.now(DEPLOYMENT_TIMEZONE)
+    expiry = DEPLOYMENT_EXPIRY
+    remaining = expiry - now
+
+    expiry_timestamp = int(expiry.timestamp())
+
+    if remaining.total_seconds() <= 0:
+        status = (
+            "⚠️ **The configured renewal deadline has passed!**\n"
+            "Please check your hosting panel and renew the deployment."
+        )
+    else:
+        total_seconds = int(remaining.total_seconds())
+        days, remainder = divmod(total_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, _ = divmod(remainder, 60)
+
+        status = (
+            f"⏳ **Time remaining:** {days} days, "
+            f"{hours} hours, {minutes} minutes"
+        )
+
+    embed = discord.Embed(
+        title="Deployment Renewal Status",
+        description=(
+            f"{status}\n\n"
+            f"**Expiry:** <t:{expiry_timestamp}:F>\n"
+            f"**Countdown:** <t:{expiry_timestamp}:R>\n\n"
+            f"[Open Bot-Hosting.net deployment]({DEPLOYMENT_URL})"
+        ),
+        color=discord.Color.from_str("#C033DD"),
+    )
+
+    await ctx.send(embed=embed)
+
+# ========================= RENEWAL FUNCTION =========================
+async def check_deployment_renewal():
+    """Send one reminder when the configured expiry time is reached."""
+
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            now = datetime.now(DEPLOYMENT_TIMEZONE)
+
+            if now >= DEPLOYMENT_EXPIRY:
+                state = {}
+
+                if DEPLOYMENT_REMINDER_STATE_FILE.exists():
+                    try:
+                        state = json.loads(
+                            DEPLOYMENT_REMINDER_STATE_FILE.read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                    except (json.JSONDecodeError, OSError):
+                        logging.exception(
+                            "Could not read deployment reminder state."
+                        )
+
+                expiry_key = DEPLOYMENT_EXPIRY.isoformat()
+
+                if state.get("last_reminded_expiry") != expiry_key:
+                    channel = bot.get_channel(
+                        DEPLOYMENT_RENEWAL_CHANNEL_ID
+                    )
+
+                    if channel is None:
+                        try:
+                            channel = await bot.fetch_channel(
+                                DEPLOYMENT_RENEWAL_CHANNEL_ID
+                            )
+                        except discord.HTTPException:
+                            logging.exception(
+                                "Could not fetch deployment reminder channel."
+                            )
+                            await asyncio.sleep(60)
+                            continue
+
+                    if not isinstance(
+                        channel,
+                        (discord.TextChannel, discord.Thread)
+                    ):
+                        logging.error(
+                            "Deployment reminder destination is invalid."
+                        )
+                        await asyncio.sleep(60)
+                        continue
+
+                    role = channel.guild.get_role(
+                        DEPLOYMENT_MODERATOR_ROLE_ID
+                    )
+
+                    if role is None:
+                        logging.error(
+                            "Deployment moderator role was not found."
+                        )
+                        await asyncio.sleep(60)
+                        continue
+
+                    message = (
+                        f"{role.mention}\n\n"
+                        "## Deployment Renewal Reminder\n\n"
+                        "The Child Labourer deployment has reached its "
+                        "configured renewal deadline.\n\n"
+                        f"**Expiry:** <t:{int(DEPLOYMENT_EXPIRY.timestamp())}:F>\n"
+                        f"**Relative time:** <t:{int(DEPLOYMENT_EXPIRY.timestamp())}:R>\n\n"
+                        f"[Renew the deployment on Bot-Hosting.net]({DEPLOYMENT_URL})\n\n"
+                        "Please renew the deployment and update the expiry "
+                        "date in `main.py` for the next cycle."
+                    )
+
+                    await channel.send(
+                        message,
+                        allowed_mentions=discord.AllowedMentions(
+                            roles=True
+                        ),
+                    )
+
+                    state["last_reminded_expiry"] = expiry_key
+
+                    DEPLOYMENT_REMINDER_STATE_FILE.write_text(
+                        json.dumps(state, indent=4),
+                        encoding="utf-8",
+                    )
+
+                    logging.info(
+                        "Deployment renewal reminder sent for %s",
+                        expiry_key,
+                    )
+
+        except Exception:
+            logging.exception(
+                "Deployment renewal reminder encountered an error."
+            )
+
+        await asyncio.sleep(60)
 # ========================= START BOT =========================
 
 install_role_manager(bot)
