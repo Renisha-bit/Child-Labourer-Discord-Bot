@@ -1,12 +1,32 @@
 high to low priority todo list
 
+make a new role panel
+ 🎸 Rock / Metal
+🎧 Pop / K-pop
+🎤 Hip-hop / Rap
+💜 Indie / Alternative
+🌌 EDM / Electronic
+🌙 Lo-fi / Ambient
+🎻 Classical / Jazz
+🔀 Everything. My playlist has identity issues.
+❓ Something else. Don't make me explain.
+
 make the message deletion of containing vulger words smoother 
+
 add logs for edits and message delteion that is not bypass-able | some are still able to bypass the message delteion so figure that out
-Add a remainder thing that child laborer send a message to restart the platform every 4 days amd tell 
+
 Some interactive commands
+
 how much time is left by checking the platform 
-see ig we can integrate ai with this bot and let bot it self interact with other in a seperate bot channel and bot have it own personality 
+
+integrate ai with this bot and let bot it self interact with other in a seperate bot channel and bot have it own personality 
+
 Create a separate channel for child laboror after all new features are added 
+
 Send a message of all the interactive commands of child labror 
+
+add a command where child labourer ping the recent join members maybe make a new roles for new mwmbers who join server as server being a community server and not from any invite. from the command child labourer pings them, greets them and give a small intro anobut altair and the server dew importat\nt channel and altair social should be includede too with a link. and i think this should trigger automatically if 2 ppl are joined without any invite and just by te name of the server 
+
 make a interactive dashboard
+
 make a bot website (use github as host itself)
