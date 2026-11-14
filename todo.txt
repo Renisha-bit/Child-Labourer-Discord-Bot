@@ -11,6 +11,9 @@ make a new role panel
 🔀 Everything. My playlist has identity issues.
 ❓ Something else. Don't make me explain.
 
+"python package using conda workflow run failed for main branch" error in deployment check that 
+
+
 [DONE] make the message deletion of containing vulger words smoother 
 
 add logs for edits and message delteion that is not bypass-able | some are still able to bypass the message delteion so figure that out
