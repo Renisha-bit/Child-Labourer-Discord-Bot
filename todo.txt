@@ -25,7 +25,9 @@ Create a separate channel for child laboror after all new features are added
 
 Send a message of all the interactive commands of child labror 
 
-add a feature in child labourer that it wil make a list of song that ppl recommended and pin the list and also keep that list updated everytime 
+[DONE] add a feature in child labourer that it wil make a list of song that ppl recommended and pin the list and also keep that list updated everytime 
+-> NEED to add a review from which we can review which songs those are and then approve
+-> and have childlabourer add all the songs that were recommended before its this new feature implemented
 
 add a command where child labourer ping the recent join members maybe make a new roles for new mwmbers who join server as server being a community server and not from any invite. from the command child labourer pings them, greets them and give a small intro anobut altair and the server dew importat\nt channel and altair social should be includede too with a link. and i think this should trigger automatically if 2 ppl are joined without any invite and just by te name of the server 
 
