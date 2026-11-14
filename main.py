@@ -11,6 +11,7 @@ import re
 
 import aiohttp
 import discord
+from discord import message
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -21,6 +22,7 @@ import json
 # Reaction roles live entirely in role_manager.py (database-driven). main.py must not
 # define its own reaction handlers or panel commands, or the two would clash.
 from role_manager import ROLE_CHANNEL_ID, install_role_manager
+from cover_queue import CoverQueueManager, register_cover_commands
 
 load_dotenv()
 token = os.getenv("DISCORD_TOKEN")
@@ -46,11 +48,21 @@ intents.members = True
 
 bot = commands.Bot(command_prefix=".", intents=intents)
 
+# Cover Queue Configuration
+COVER_RECOMMENDATION_CHANNEL_ID = 1550399214771769384  # song recommendation channel ID
+COVER_SINGER_ROLE_ID = 1451973729620988074             # dedicated singer role ID [Mr. Vocalist and his band]
+
+cover_manager: CoverQueueManager | None = None
+
 error_log = logging.getLogger("discord.bot")
 
-# Kept as a module variable (not an attribute on `bot`) so type checkers don't complain.
-youtube_task: Optional[asyncio.Task] = None
+cover_manager = CoverQueueManager(
+    bot=bot,
+    channel_id=COVER_RECOMMENDATION_CHANNEL_ID,
+    singer_role_id=COVER_SINGER_ROLE_ID,
+)
 
+register_cover_commands(bot, cover_manager)
 # ========================= EVENTS =========================
 
 # Prints what the bot receives and what it does to THIS terminal, so you can see exactly where
@@ -108,6 +120,9 @@ async def on_ready():
             check_deployment_renewal()
         )
 
+    if cover_manager is not None and COVER_RECOMMENDATION_CHANNEL_ID != 0:
+        await cover_manager.start()
+
 @bot.event
 async def on_member_join(member):
     channel = bot.get_channel(WELCOME_CHANNEL_ID)
@@ -155,7 +170,15 @@ async def on_message(message):
         # Don't run commands from a message that was just removed for breaking the rules.
         return
 
-    await bot.process_commands(message)
+    if (
+        cover_manager is not None
+        and COVER_RECOMMENDATION_CHANNEL_ID != 0
+        and message.channel.id == COVER_RECOMMENDATION_CHANNEL_ID
+    ):
+    
+        await cover_manager.on_message(message)
+
+    await bot.process_commands(message) 
 
 
 @bot.listen("on_command")

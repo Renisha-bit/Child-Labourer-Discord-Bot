@@ -11,7 +11,7 @@ make a new role panel
 🔀 Everything. My playlist has identity issues.
 ❓ Something else. Don't make me explain.
 
-make the message deletion of containing vulger words smoother 
+[DONE] make the message deletion of containing vulger words smoother 
 
 add logs for edits and message delteion that is not bypass-able | some are still able to bypass the message delteion so figure that out
 
