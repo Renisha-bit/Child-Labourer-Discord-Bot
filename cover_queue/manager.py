@@ -367,9 +367,7 @@ class CoverQueueManager:
         completed = self.get_numbered_songs("completed")
 
         lines = [
-            "✦ ───────────────────────── ✦",
-            "🎶 TO BE COVERED",
-            "✦ ───────────────────────── ✦",
+            "✦ TO BE COVERED",
             "",
         ]
 
@@ -388,8 +386,8 @@ class CoverQueueManager:
 
         lines.extend([
             "✦ ───────────────────────── ✦",
-            "🎙️ COMPLETED COVERS",
-            "✦ ───────────────────────── ✦",
+            "",
+            "✦ COMPLETED COVERS",
             "",
         ])
 
