@@ -29,6 +29,6 @@ add a feature in child labourer that it wil make a list of song that ppl recomme
 
 add a command where child labourer ping the recent join members maybe make a new roles for new mwmbers who join server as server being a community server and not from any invite. from the command child labourer pings them, greets them and give a small intro anobut altair and the server dew importat\nt channel and altair social should be includede too with a link. and i think this should trigger automatically if 2 ppl are joined without any invite and just by te name of the server 
 
-make a interactive dashboard
+make a interactive dashboard (use streamlit)
 
 make a bot website (use github as host itself)

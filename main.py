@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+import re
 
 import aiohttp
 import discord
@@ -114,6 +115,20 @@ async def on_member_join(member):
     if isinstance(channel, discord.TextChannel):
         await channel.send(f"Welcome {member.mention} to the server!")
 
+# Words that Child Labourer should filter
+BANNED_WORDS = [
+    "niqqa",
+]
+
+def contains_bad_word(content: str) -> bool:
+    pattern = r"(?<!\w)(?:" + "|".join(
+        re.escape(word) for word in BANNED_WORDS if word.strip()
+    ) + r")(?!\w)"
+
+    if not BANNED_WORDS:
+        return False
+
+    return re.search(pattern, content, re.IGNORECASE) is not None
 
 @bot.event
 async def on_message(message):
@@ -123,12 +138,16 @@ async def on_message(message):
     if DEBUG_PRINTS and message.content.startswith("."):
         print(f"[received] {message.author}: {message.content[:100]}")
 
-    if "niqqa" in message.content.lower():
+    if contains_bad_word(message.content):
         try:
             await message.delete()
             await message.channel.send(
-                f"{message.author.mention}, please be respectful!"
+                f"{message.author.mention}, please be respectful!",
+                delete_after=4
             )
+
+        except discord.NotFound:
+            pass
         except discord.Forbidden:
             print("Missing permission to delete messages.")
         except discord.HTTPException as error:
