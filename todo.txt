@@ -13,6 +13,7 @@ make a new role panel
 
 "python package using conda workflow run failed for main branch" error in deployment check that 
 
+change variable names better
 
 [DONE] make the message deletion of containing vulger words smoother 
 
